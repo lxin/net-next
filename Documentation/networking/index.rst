@@ -107,6 +107,7 @@ Contents:
    representors
    rxrpc
    sctp
+   quic
    secid
    seg6-sysctl
    skbuff
