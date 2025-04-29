@@ -15,6 +15,7 @@
 #include "family.h"
 #include "stream.h"
 #include "connid.h"
+#include "path.h"
 
 #include "protocol.h"
 
@@ -40,6 +41,7 @@ struct quic_sock {
 	struct quic_stream_table	streams;
 	struct quic_conn_id_set		source;
 	struct quic_conn_id_set		dest;
+	struct quic_path_group		paths;
 };
 
 struct quic6_sock {
@@ -92,6 +94,16 @@ static inline struct quic_conn_id_set *quic_dest(const struct sock *sk)
 	return &quic_sk(sk)->dest;
 }
 
+static inline struct quic_path_group *quic_paths(const struct sock *sk)
+{
+	return &quic_sk(sk)->paths;
+}
+
+static inline bool quic_is_serv(const struct sock *sk)
+{
+	return quic_paths(sk)->serv;
+}
+
 static inline bool quic_is_establishing(struct sock *sk)
 {
 	return sk->sk_state == QUIC_SS_ESTABLISHING;
@@ -115,14 +127,19 @@ static inline bool quic_is_closed(struct sock *sk)
 static inline void quic_set_state(struct sock *sk, int state)
 {
 	struct net *net = sock_net(sk);
+	int mib;
 
 	if (sk->sk_state == state)
 		return;
 
-	if (state == QUIC_SS_ESTABLISHED)
+	if (state == QUIC_SS_ESTABLISHED) {
+		mib = quic_is_serv(sk) ? QUIC_MIB_CONN_PASSIVEESTABS
+				       : QUIC_MIB_CONN_ACTIVEESTABS;
+		QUIC_INC_STATS(net, mib);
 		QUIC_INC_STATS(net, QUIC_MIB_CONN_CURRENTESTABS);
-	else if (quic_is_established(sk))
+	} else if (quic_is_established(sk)) {
 		QUIC_DEC_STATS(net, QUIC_MIB_CONN_CURRENTESTABS);
+	}
 
 	inet_sk_set_state(sk, state);
 	sk->sk_state_change(sk);
