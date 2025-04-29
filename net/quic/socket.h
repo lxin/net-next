@@ -13,6 +13,7 @@
 
 #include "common.h"
 #include "family.h"
+#include "stream.h"
 
 #include "protocol.h"
 
@@ -34,6 +35,8 @@ struct quic_sock {
 	struct quic_data		ticket;
 	struct quic_data		token;
 	struct quic_data		alpn;
+
+	struct quic_stream_table	streams;
 };
 
 struct quic6_sock {
@@ -69,6 +72,11 @@ static inline struct quic_data *quic_ticket(const struct sock *sk)
 static inline struct quic_data *quic_alpn(const struct sock *sk)
 {
 	return &quic_sk(sk)->alpn;
+}
+
+static inline struct quic_stream_table *quic_streams(const struct sock *sk)
+{
+	return &quic_sk(sk)->streams;
 }
 
 static inline bool quic_is_establishing(struct sock *sk)
