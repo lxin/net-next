@@ -712,8 +712,15 @@ int quic_packet_config(struct sock *sk, u8 level, u8 path)
 
 static void quic_packet_encrypt_done(struct sk_buff *skb, int err)
 {
-	/* Free it for now, future patches will implement the actual deferred transmission logic. */
-	kfree_skb(skb);
+	if (err) {
+		QUIC_INC_STATS(sock_net(skb->sk), QUIC_MIB_PKT_ENCDROP);
+		kfree_skb(skb);
+		pr_debug("%s: err: %d\n", __func__, err);
+		return;
+	}
+
+	/* Encryption succeeded: queue the encrypted skb for asynchronous transmission. */
+	quic_outq_encrypted_tail(skb->sk, skb);
 }
 
 /* Coalescing Packets. */

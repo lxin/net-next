@@ -56,8 +56,34 @@ out:
 	sock_put(sk);
 }
 
+#define QUIC_MAX_ALT_PROBES	3
+
 void quic_timer_path_handler(struct sock *sk)
 {
+	struct quic_path_group *paths = quic_paths(sk);
+	u8 path = 0;
+
+	if (quic_is_closed(sk))
+		return;
+
+	/* PATH_CHALLENGE frames are reused to keep the new path alive for NAT rebind.
+	 * Skip probe attempt counting unless the path is explicitly in PROBING state.
+	 */
+	if (!quic_path_alt_state(paths, QUIC_PATH_ALT_PROBING))
+		goto out;
+
+	/* Increment probe attempts; give up if exceeded max allowed. */
+	if (paths->alt_probes++ < QUIC_MAX_ALT_PROBES) {
+		path = 1;
+		goto out;
+	}
+
+	/* Probing failed; drop the alternate path. */
+	quic_path_free(sk, paths, 1);
+
+out:
+	quic_outq_transmit_frame(sk, QUIC_FRAME_PATH_CHALLENGE, NULL, path, false);
+	quic_timer_reset_path(sk);
 }
 
 static void quic_timer_path_timeout(struct timer_list *t)
@@ -91,6 +117,10 @@ void quic_timer_reset_path(struct sock *sk)
 
 void quic_timer_pmtu_handler(struct sock *sk)
 {
+	if (quic_is_closed(sk))
+		return;
+
+	quic_outq_transmit_probe(sk);
 }
 
 static void quic_timer_pmtu_timeout(struct timer_list *t)
@@ -113,6 +143,10 @@ out:
 
 void quic_timer_pace_handler(struct sock *sk)
 {
+	if (quic_is_closed(sk))
+		return;
+
+	quic_outq_transmit(sk);
 }
 
 static enum hrtimer_restart quic_timer_pace_timeout(struct hrtimer *hr)
