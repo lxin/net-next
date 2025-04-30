@@ -1624,6 +1624,180 @@ static int quic_sock_connection_migrate(struct sock *sk, struct sockaddr *addr, 
 	return err;
 }
 
+/* Validate and copy QUIC transport parameters. */
+static int quic_param_check_and_copy(struct quic_transport_param *p,
+				     struct quic_transport_param *param)
+{
+	if (p->max_udp_payload_size) {
+		if (p->max_udp_payload_size < QUIC_MIN_UDP_PAYLOAD ||
+		    p->max_udp_payload_size > QUIC_MAX_UDP_PAYLOAD)
+			return -EINVAL;
+		param->max_udp_payload_size = p->max_udp_payload_size;
+	}
+	if (p->ack_delay_exponent) {
+		if (p->ack_delay_exponent > QUIC_MAX_ACK_DELAY_EXPONENT)
+			return -EINVAL;
+		param->ack_delay_exponent = p->ack_delay_exponent;
+	}
+	if (p->max_ack_delay) {
+		if (p->max_ack_delay >= QUIC_MAX_ACK_DELAY)
+			return -EINVAL;
+		param->max_ack_delay = p->max_ack_delay;
+	}
+	if (p->active_connection_id_limit) {
+		if (p->active_connection_id_limit < QUIC_CONN_ID_LEAST ||
+		    p->active_connection_id_limit > QUIC_CONN_ID_LIMIT)
+			return -EINVAL;
+		param->active_connection_id_limit = p->active_connection_id_limit;
+	}
+	if (p->max_idle_timeout) {
+		if (p->max_idle_timeout < QUIC_MIN_IDLE_TIMEOUT)
+			return -EINVAL;
+		param->max_idle_timeout = p->max_idle_timeout;
+	}
+	if (p->max_datagram_frame_size) {
+		if (p->max_datagram_frame_size < QUIC_PATH_MIN_PMTU)
+			return -EINVAL;
+		param->max_datagram_frame_size = p->max_datagram_frame_size;
+	}
+	if (p->max_data) {
+		if (p->max_data < QUIC_PATH_MIN_PMTU ||
+		    (!p->remote && p->max_data > (S32_MAX / 2)))
+			return -EINVAL;
+		param->max_data = p->max_data;
+	}
+	if (p->max_stream_data_bidi_local) {
+		if (p->max_stream_data_bidi_local < QUIC_PATH_MIN_PMTU ||
+		    (!p->remote && p->max_stream_data_bidi_local > (S32_MAX / 4)))
+			return -EINVAL;
+		param->max_stream_data_bidi_local = p->max_stream_data_bidi_local;
+	}
+	if (p->max_stream_data_bidi_remote) {
+		if (p->max_stream_data_bidi_remote < QUIC_PATH_MIN_PMTU ||
+		    (!p->remote && p->max_stream_data_bidi_remote > (S32_MAX / 4)))
+			return -EINVAL;
+		param->max_stream_data_bidi_remote = p->max_stream_data_bidi_remote;
+	}
+	if (p->max_stream_data_uni) {
+		if (p->max_stream_data_uni < QUIC_PATH_MIN_PMTU ||
+		    (!p->remote && p->max_stream_data_uni > (S32_MAX / 4)))
+			return -EINVAL;
+		param->max_stream_data_uni = p->max_stream_data_uni;
+	}
+	if (p->max_streams_bidi) {
+		if (p->max_streams_bidi > QUIC_MAX_STREAMS) {
+			if (!p->remote)
+				return -EINVAL;
+			p->max_streams_bidi = QUIC_MAX_STREAMS;
+		}
+		param->max_streams_bidi = p->max_streams_bidi;
+	}
+	if (p->max_streams_uni) {
+		if (p->max_streams_uni > QUIC_MAX_STREAMS) {
+			if (!p->remote)
+				return -EINVAL;
+			p->max_streams_uni = QUIC_MAX_STREAMS;
+		}
+		param->max_streams_uni = p->max_streams_uni;
+	}
+	if (p->disable_active_migration)
+		param->disable_active_migration = p->disable_active_migration;
+	if (p->disable_1rtt_encryption)
+		param->disable_1rtt_encryption = p->disable_1rtt_encryption;
+	if (p->disable_compatible_version)
+		param->disable_compatible_version = p->disable_compatible_version;
+	if (p->grease_quic_bit)
+		param->grease_quic_bit = p->grease_quic_bit;
+	if (p->stateless_reset)
+		param->stateless_reset = p->stateless_reset;
+
+	return 0;
+}
+
+static int quic_sock_set_transport_param(struct sock *sk, struct quic_transport_param *p, u32 len)
+{
+	struct quic_transport_param param = {};
+
+	if (len < sizeof(param) || quic_is_established(sk))
+		return -EINVAL;
+
+	/* Manually setting remote transport parameters is required only to enable 0-RTT data
+	 * transmission during handshake initiation.
+	 */
+	if (p->remote && !quic_is_establishing(sk))
+		return -EINVAL;
+
+	param.remote = p->remote;
+	quic_sock_fetch_transport_param(sk, &param);
+
+	if (quic_param_check_and_copy(p, &param))
+		return -EINVAL;
+
+	quic_sock_apply_transport_param(sk, &param);
+	return 0;
+}
+
+static int quic_sock_set_config(struct sock *sk, struct quic_config *c, u32 len)
+{
+	if (len < sizeof(*c) || quic_is_established(sk))
+		return -EINVAL;
+
+	return quic_sock_apply_config(sk, c);
+}
+
+#define QUIC_ALPN_MAX_LEN	128
+
+static int quic_sock_set_alpn(struct sock *sk, u8 *data, u32 len)
+{
+	struct quic_data *alpns = quic_alpn(sk);
+	u8 *p;
+
+	if (!len || len > QUIC_ALPN_MAX_LEN || quic_is_listen(sk))
+		return -EINVAL;
+
+	p = kzalloc(len + 1, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	kfree(alpns->data);
+	alpns->data = p;
+	alpns->len  = len + 1;
+
+	quic_data_from_string(alpns, data, len);
+	return 0;
+}
+
+static int quic_sock_set_token(struct sock *sk, void *data, u32 len)
+{
+	if (quic_is_serv(sk)) {
+		/* For servers, send a regular token to client via NEW_TOKEN frames after
+		 * handshake.
+		 */
+		if (!quic_is_established(sk))
+			return -EINVAL;
+		/* Defer sending; a NEW_TOKEN frame is already in flight. */
+		if (quic_outq(sk)->token_pending)
+			return -EAGAIN;
+		if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_TOKEN, NULL, 0, false))
+			return -ENOMEM;
+		return 0;
+	}
+
+	/* For clients, use the regular token next time before handshake. */
+	if (!len || len > QUIC_TOKEN_MAX_LEN)
+		return -EINVAL;
+
+	return quic_data_dup(quic_token(sk), data, len);
+}
+
+static int quic_sock_set_session_ticket(struct sock *sk, u8 *data, u32 len)
+{
+	if (len < QUIC_TICKET_MIN_LEN || len > QUIC_TICKET_MAX_LEN)
+		return -EINVAL;
+
+	return quic_data_dup(quic_ticket(sk), data, len);
+}
+
 static int quic_do_setsockopt(struct sock *sk, int optname, sockptr_t optval, unsigned int optlen)
 {
 	void *kopt = NULL;
@@ -1657,6 +1831,21 @@ static int quic_do_setsockopt(struct sock *sk, int optname, sockptr_t optval, un
 		break;
 	case QUIC_SOCKOPT_KEY_UPDATE:
 		retval = quic_crypto_key_update(quic_crypto(sk, QUIC_CRYPTO_APP));
+		break;
+	case QUIC_SOCKOPT_TRANSPORT_PARAM:
+		retval = quic_sock_set_transport_param(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CONFIG:
+		retval = quic_sock_set_config(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_ALPN:
+		retval = quic_sock_set_alpn(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_TOKEN:
+		retval = quic_sock_set_token(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_SESSION_TICKET:
+		retval = quic_sock_set_session_ticket(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;
@@ -1801,6 +1990,116 @@ static int quic_sock_get_connection_close(struct sock *sk, u32 len, sockptr_t op
 	return 0;
 }
 
+static int quic_sock_get_transport_param(struct sock *sk, u32 len,
+					 sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_transport_param param = {};
+
+	if (len < sizeof(param))
+		return -EINVAL;
+	len = sizeof(param);
+	if (copy_from_sockptr(&param, optval, len))
+		return -EFAULT;
+
+	quic_sock_fetch_transport_param(sk, &param);
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, &param, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_config(struct sock *sk, u32 len, sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_config config, *c = quic_config(sk);
+
+	if (len < sizeof(config))
+		return -EINVAL;
+	len = sizeof(config);
+
+	config = *c;
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, &config, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_alpn(struct sock *sk, u32 len, sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_data *alpns = quic_alpn(sk);
+	u8 data[QUIC_ALPN_MAX_LEN];
+
+	if (!alpns->len) {
+		len = 0;
+		goto out;
+	}
+	if (len < alpns->len)
+		return -EINVAL;
+
+	quic_data_to_string(data, &len, alpns);
+
+out:
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, data, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_token(struct sock *sk, u32 len, sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_data *token = quic_token(sk);
+
+	if (quic_is_serv(sk) || len < token->len)
+		return -EINVAL;
+	len = token->len;
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, token->data, len))
+		return -EFAULT;
+	return 0;
+}
+
+#define QUIC_TICKET_MASTER_KEY_LEN		64
+
+static int quic_sock_get_session_ticket(struct sock *sk, u32 len,
+					sockptr_t optval, sockptr_t optlen)
+{
+	u8 *ticket = quic_ticket(sk)->data, key[QUIC_TICKET_MASTER_KEY_LEN];
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_APP);
+	u32 tlen = quic_ticket(sk)->len;
+	union quic_addr a;
+
+	if (!quic_is_serv(sk)) {
+		/* For clients, retrieve the received TLS NewSessionTicket message. */
+		if (quic_is_established(sk) && !crypto->ticket_ready)
+			tlen = 0;
+		goto out;
+	}
+
+	if (quic_is_closed(sk))
+		return -EINVAL;
+
+	/* For servers, return the master key used for session resumption.  If already set,
+	 * reuse it.
+	 */
+	if (tlen)
+		goto out;
+
+	/* If not already set, derive the key using the peer address. */
+	crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	memcpy(&a, quic_path_daddr(quic_paths(sk), 0), sizeof(a));
+	a.v4.sin_port = 0;
+	if (quic_crypto_generate_session_ticket_key(crypto, &a, sizeof(a), key,
+						    QUIC_TICKET_MASTER_KEY_LEN))
+		return -EINVAL;
+	ticket = key;
+	tlen = QUIC_TICKET_MASTER_KEY_LEN;
+out:
+	if (len < tlen)
+		return -EINVAL;
+	len = tlen;
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, ticket, len))
+		return -EFAULT;
+	return 0;
+}
+
 static int quic_do_getsockopt(struct sock *sk, int optname, sockptr_t optval, sockptr_t optlen)
 {
 	int retval = 0;
@@ -1822,6 +2121,21 @@ static int quic_do_getsockopt(struct sock *sk, int optname, sockptr_t optval, so
 		break;
 	case QUIC_SOCKOPT_CONNECTION_CLOSE:
 		retval = quic_sock_get_connection_close(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_TRANSPORT_PARAM:
+		retval = quic_sock_get_transport_param(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_CONFIG:
+		retval = quic_sock_get_config(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_ALPN:
+		retval = quic_sock_get_alpn(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_TOKEN:
+		retval = quic_sock_get_token(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_SESSION_TICKET:
+		retval = quic_sock_get_session_ticket(sk, len, optval, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;
