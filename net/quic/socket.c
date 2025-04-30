@@ -1798,6 +1798,166 @@ static int quic_sock_set_session_ticket(struct sock *sk, u8 *data, u32 len)
 	return quic_data_dup(quic_ticket(sk), data, len);
 }
 
+#define QUIC_TP_EXT_MAX_LEN	256
+
+static int quic_sock_set_transport_params_ext(struct sock *sk, u8 *p, u32 len)
+{
+	struct quic_transport_param param = {};
+	u32 errcode;
+
+	if (!quic_is_establishing(sk) || len > QUIC_TP_EXT_MAX_LEN)
+		return -EINVAL;
+
+	param.remote = 1;
+	if (quic_frame_parse_transport_params_ext(sk, &param, p, len)) {
+		errcode = QUIC_TRANSPORT_ERROR_TRANSPORT_PARAM;
+		quic_outq_transmit_close(sk, 0, errcode, QUIC_CRYPTO_INITIAL);
+		return -EINVAL;
+	}
+
+	quic_sock_apply_transport_param(sk, &param);
+	return 0;
+}
+
+static int quic_sock_set_crypto_secret(struct sock *sk, struct quic_crypto_secret *secret, u32 len)
+{
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_config *c = quic_config(sk);
+	struct quic_crypto *crypto;
+	struct sk_buff_head tmpq;
+	struct sk_buff *skb;
+	union quic_addr *a;
+	int err;
+
+	if (!quic_is_establishing(sk) || len != sizeof(*secret))
+		return -EINVAL;
+
+	/* Accept only supported levels: Handshake, 0-RTT (Early), or 1-RTT (App).  The initial
+	 * secret was already derived in-kernel using the original destination connection ID.
+	 */
+	if (secret->level != QUIC_CRYPTO_APP &&
+	    secret->level != QUIC_CRYPTO_EARLY &&
+	    secret->level != QUIC_CRYPTO_HANDSHAKE)
+		return -EINVAL;
+
+	/* Install keys into the crypto context. */
+	crypto = quic_crypto(sk, secret->level);
+	err = quic_crypto_set_secret(crypto, secret, packet->version, 0);
+	if (err)
+		return err;
+
+	if (secret->level != QUIC_CRYPTO_APP) {
+		if (secret->send) { /* 0-RTT or Handshake send key is ready. */
+			/* If 0-RTT send key is ready, set data_level to EARLY.  This allows
+			 * quic_outq_transmit_stream() to emit stream frames in 0-RTT packets.
+			 */
+			if (secret->level == QUIC_CRYPTO_EARLY)
+				outq->data_level = QUIC_CRYPTO_EARLY;
+			return 0;
+		}
+		/* 0-RTT or Handshake receive key is ready; decrypt and process all buffered
+		 * 0-RTT or Handshake packets.
+		 */
+		__skb_queue_head_init(&tmpq);
+		skb_queue_splice_init(&inq->backlog_list, &tmpq);
+		skb = __skb_dequeue(&tmpq);
+		while (skb) {
+			quic_packet_process(sk, skb);
+			skb = __skb_dequeue(&tmpq);
+		}
+		return 0;
+	}
+
+	if (secret->send) {
+		/* App send key is ready, set data_level to APP. This allows
+		 * quic_outq_transmit_stream() to emit stream frames in 1-RTT packets.
+		 */
+		outq->data_level = QUIC_CRYPTO_APP;
+		if (!crypto->recv_ready)
+			return 0;
+		goto done; /* Both send and receive keys are ready; handshake complete. */
+	}
+
+	/* Free previously stored TLS session ticket and QUIC token data, allowing reception of
+	 * fresh NewSessionTicket message and regular token in NEW_TOKEN frames from the peer
+	 * during handshake completion.
+	 */
+	quic_data_free(quic_ticket(sk));
+	quic_data_free(quic_token(sk));
+	if (!list_empty(&inq->early_list)) {
+		/* If any 0-RTT data was buffered (early_list), move it to the main receive
+		 * list (recv_list) so it becomes available to the application.
+		 */
+		list_splice_init(&inq->early_list, &inq->recv_list);
+		sk->sk_data_ready(sk);
+	}
+	/* App receive key is ready; decrypt and process all buffered App/1-RTT packets. */
+	__skb_queue_head_init(&tmpq);
+	skb_queue_splice_init(&inq->backlog_list, &tmpq);
+	skb = __skb_dequeue(&tmpq);
+	while (skb) {
+		quic_packet_process(sk, skb);
+		skb = __skb_dequeue(&tmpq);
+	}
+
+	if (!crypto->send_ready)
+		return 0;
+done:
+	/* Both send and receive keys are ready; handshake complete. */
+	if (!quic_is_serv(sk)) {
+		if (!paths->pref_addr)
+			goto out;
+		/* The peer offered a preferred address (stored in path 1).  Reset the flag to
+		 * avoid reprocessing, and Perform routing on new path and set the local address
+		 * for new path.
+		 */
+		if (quic_packet_config(sk, 0, 1)) {
+			paths->pref_addr = 0; /* Ignore the preferred address. */
+			goto out;
+		}
+		/* If the local address for new path is different from the current one, bind to
+		 * the new address.
+		 */
+		a = quic_path_saddr(paths, 1);
+		a->v4.sin_port = quic_path_saddr(paths, 0)->v4.sin_port;
+		if (!quic_cmp_sk_addr(sk, quic_path_saddr(paths, 0), a)) {
+			a->v4.sin_port = 0;
+			if (quic_path_bind(sk, paths, 1)) {
+				paths->pref_addr = 0; /* Ignore the preferred address. */
+				goto out;
+			}
+		}
+		goto out;
+	}
+
+	/* Clean up transmitted handshake packets. */
+	quic_outq_transmitted_sack(sk, QUIC_CRYPTO_HANDSHAKE, QUIC_PN_MAP_MAX_PN, 0, -1, 0);
+	if (paths->pref_addr) {
+		/* If a preferred address is set, bind to it to allow client use at any time. */
+		err = quic_path_bind(sk, paths, 1);
+		if (err)
+			return err;
+	}
+
+	/* Send NEW_TOKEN and HANDSHAKE_DONE frames (server only). */
+	if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_TOKEN, NULL, 0, true))
+		return -ENOMEM;
+	if (quic_outq_transmit_frame(sk, QUIC_FRAME_HANDSHAKE_DONE, NULL, 0, true))
+		return -ENOMEM;
+out:
+	/* Send NEW_CONNECTION_ID frames to ensure maximum connection IDs are added. */
+	if (quic_outq_transmit_new_conn_id(sk, 0, 0, false))
+		return -ENOMEM;
+	/* Enter established state, and start PLPMTUD timer and Path Challenge timer. */
+	quic_set_state(sk, QUIC_SS_ESTABLISHED);
+	quic_timer_start(sk, QUIC_TIMER_PMTU, c->plpmtud_probe_interval);
+	quic_timer_reset_path(sk);
+	return 0;
+}
+
 static int quic_do_setsockopt(struct sock *sk, int optname, sockptr_t optval, unsigned int optlen)
 {
 	void *kopt = NULL;
@@ -1846,6 +2006,12 @@ static int quic_do_setsockopt(struct sock *sk, int optname, sockptr_t optval, un
 		break;
 	case QUIC_SOCKOPT_SESSION_TICKET:
 		retval = quic_sock_set_session_ticket(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_TRANSPORT_PARAM_EXT:
+		retval = quic_sock_set_transport_params_ext(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CRYPTO_SECRET:
+		retval = quic_sock_set_crypto_secret(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;
@@ -2100,6 +2266,50 @@ out:
 	return 0;
 }
 
+static int quic_sock_get_transport_params_ext(struct sock *sk, u32 len,
+					      sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_transport_param param = {};
+	u8 data[QUIC_TP_EXT_MAX_LEN];
+	u32 datalen = 0;
+
+	if (!quic_is_establishing(sk))
+		return -EINVAL;
+
+	quic_sock_fetch_transport_param(sk, &param);
+
+	if (quic_frame_build_transport_params_ext(sk, &param, data, &datalen))
+		return -EINVAL;
+	if (len < datalen)
+		return -EINVAL;
+	len = datalen;
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, data, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_crypto_secret(struct sock *sk, u32 len,
+				       sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_crypto_secret secret = {};
+
+	if (len < sizeof(secret))
+		return -EINVAL;
+	len = sizeof(secret);
+	if (copy_from_sockptr(&secret, optval, len))
+		return -EFAULT;
+
+	if (secret.level >= QUIC_CRYPTO_MAX)
+		return -EINVAL;
+	if (quic_crypto_get_secret(quic_crypto(sk, secret.level), &secret))
+		return -EINVAL;
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) || copy_to_sockptr(optval, &secret, len))
+		return -EFAULT;
+	return 0;
+}
+
 static int quic_do_getsockopt(struct sock *sk, int optname, sockptr_t optval, sockptr_t optlen)
 {
 	int retval = 0;
@@ -2136,6 +2346,12 @@ static int quic_do_getsockopt(struct sock *sk, int optname, sockptr_t optval, so
 		break;
 	case QUIC_SOCKOPT_SESSION_TICKET:
 		retval = quic_sock_get_session_ticket(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_TRANSPORT_PARAM_EXT:
+		retval = quic_sock_get_transport_params_ext(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_CRYPTO_SECRET:
+		retval = quic_sock_get_crypto_secret(sk, len, optval, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;
