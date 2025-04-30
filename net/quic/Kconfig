@@ -33,3 +33,9 @@ menuconfig IP_QUIC
 	  kernel's dynamic debugging framework.
 
 	  If in doubt, say N.
+
+if IP_QUIC
+config IP_QUIC_TEST
+	depends on NET_HANDSHAKE
+	def_tristate m
+endif
