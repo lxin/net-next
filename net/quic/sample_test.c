@@ -1,0 +1,726 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* QUIC kernel implementation
+ * (C) Copyright Red Hat Corp. 2023
+ *
+ * This file is kernel test of the QUIC kernel implementation
+ *
+ * Initialization/cleanup for QUIC protocol support.
+ *
+ * Written or modified by:
+ *    Xin Long <lucien.xin@gmail.com>
+ */
+
+#include <linux/completion.h>
+#include <linux/module.h>
+#include <linux/socket.h>
+#include <linux/kernel.h>
+#include <linux/delay.h>
+#include <linux/quic.h>
+#include <linux/inet.h>
+#include <linux/net.h>
+#include <linux/key.h>
+
+#include <net/handshake.h>
+#include <net/sock.h>
+
+#define ROLE_LEN	10
+#define IP_LEN		64
+#define ALPN_LEN	20
+
+static char role[ROLE_LEN] = "client";
+static char alpn[ALPN_LEN] = "sample";
+static char ip[IP_LEN] = "127.0.0.1";
+static char dev[IFNAMSIZ];
+static int port = 1234;
+static int psk;
+
+static u8 session_data[4096];
+
+/* Receive a message and extract QUIC stream metadata from control message. */
+static int quic_test_recvmsg(struct socket *sock, void *msg, int len, s64 *sid,
+			     u32 *flags)
+{
+	char incmsg[CMSG_SPACE(sizeof(struct quic_stream_info))];
+	struct quic_stream_info *rinfo;
+	struct cmsghdr *cmsg;
+	struct msghdr inmsg;
+	struct kvec iov;
+	int err;
+
+	iov.iov_base = msg;
+	iov.iov_len = len;
+
+	memset(&inmsg, 0, sizeof(inmsg));
+	inmsg.msg_control = incmsg;
+	inmsg.msg_controllen = sizeof(incmsg);
+
+	err = kernel_recvmsg(sock, &inmsg, &iov, 1, len, (int)(*flags));
+	if (err < 0)
+		return err;
+
+	*flags = inmsg.msg_flags;
+
+	cmsg = (struct cmsghdr *)incmsg;
+	if (cmsg->cmsg_level == SOL_QUIC &&
+	    cmsg->cmsg_type == QUIC_STREAM_INFO) {
+		rinfo = CMSG_DATA(cmsg);
+		*sid = rinfo->stream_id;
+		*flags |= rinfo->stream_flags;
+	}
+	return err;
+}
+
+/* Send a message with QUIC stream metadata via control message. */
+static int quic_test_sendmsg(struct socket *sock, const void *msg, int len,
+			     s64 sid, u32 flags)
+{
+	char outcmsg[CMSG_SPACE(sizeof(struct quic_stream_info))];
+	struct quic_stream_info *sinfo;
+	struct msghdr outmsg;
+	struct cmsghdr *cmsg;
+	struct kvec iov;
+
+	iov.iov_base = (void *)msg;
+	iov.iov_len = len;
+
+	memset(&outmsg, 0, sizeof(outmsg));
+	outmsg.msg_control = outcmsg;
+	outmsg.msg_controllen = sizeof(outcmsg);
+	outmsg.msg_flags = flags;
+
+	cmsg = (struct cmsghdr *)outcmsg;
+	cmsg->cmsg_level = SOL_QUIC;
+	cmsg->cmsg_type = QUIC_STREAM_INFO;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(*sinfo));
+
+	outmsg.msg_controllen = cmsg->cmsg_len;
+	sinfo = CMSG_DATA(cmsg);
+	sinfo->stream_id = sid;
+	sinfo->stream_flags = flags;
+
+	return kernel_sendmsg(sock, &outmsg, &iov, 1, len);
+}
+
+struct quic_test_priv {
+	struct completion sk_handshake_done;
+	struct file *filp;
+	int status;
+};
+
+/* Handshake completion callback: store status and wake waiting context. */
+static void quic_test_handshake_done(void *data, int status,
+				     key_serial_t peerid)
+{
+	struct quic_test_priv *priv = data;
+
+	priv->status = status;
+	complete_all(&priv->sk_handshake_done);
+}
+
+/* Client handshake logic using the kernel TLS handshake API. */
+static int quic_test_client_handshake(struct socket *sock,
+				      struct quic_test_priv *priv)
+{
+	struct completion *done = &priv->sk_handshake_done;
+	struct tls_handshake_args args = {};
+	gfp_t gfp = GFP_KERNEL;
+	int err;
+
+	init_completion(&priv->sk_handshake_done);
+
+	args.ta_sock = sock;
+	args.ta_done = quic_test_handshake_done;
+	args.ta_data = priv;
+	args.ta_timeout_ms = 3000;
+
+	if (psk) { /* Use PSK if configured; else X.509 handshake. */
+		args.ta_my_peerids[0] = psk;
+		args.ta_num_peerids = 1;
+		err = tls_client_hello_psk(&args, gfp);
+		if (err)
+			return err;
+		goto wait;
+	}
+
+	args.ta_peername = "server.test";
+	err = tls_client_hello_x509(&args, gfp);
+	if (err)
+		return err;
+wait:
+	/* Wait for handshake completion or timeout. */
+	err = wait_for_completion_interruptible_timeout(done, HZ * 5UL);
+	if (err <= 0) {
+		tls_handshake_cancel(sock->sk);
+		return -EINVAL;
+	}
+	return priv->status;
+}
+
+/* Server handshake logic using kernel TLS API. Similar to
+ * quic_test_client_handshake().
+ */
+static int quic_test_server_handshake(struct socket *sock,
+				      struct quic_test_priv *priv)
+{
+	struct completion *done = &priv->sk_handshake_done;
+	struct tls_handshake_args args = {};
+	gfp_t gfp = GFP_KERNEL;
+	int err;
+
+	init_completion(&priv->sk_handshake_done);
+
+	args.ta_sock = sock;
+	args.ta_done = quic_test_handshake_done;
+	args.ta_data = priv;
+	args.ta_timeout_ms = 3000;
+
+	if (psk) {
+		err = tls_server_hello_psk(&args, gfp);
+		if (err)
+			return err;
+		goto wait;
+	}
+
+	err = tls_server_hello_x509(&args, gfp);
+	if (err)
+		return err;
+wait:
+	err = wait_for_completion_interruptible_timeout(done, HZ * 5UL);
+	if (err <= 0) {
+		tls_handshake_cancel(sock->sk);
+		return -EINVAL;
+	}
+	return priv->status;
+}
+
+static int quic_test_build_address(struct sockaddr_storage *a)
+{
+	struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)a;
+	struct sockaddr_in *a4 = (struct sockaddr_in *)a;
+
+	if (in4_pton(ip, strlen(ip), (u8 *)&a4->sin_addr, -1, NULL)) {
+		a4->sin_family = AF_INET;
+		a4->sin_port = htons((u16)port);
+		return PF_INET;
+	}
+	if (in6_pton(ip, strlen(ip), (u8 *)&a6->sin6_addr, -1, NULL)) {
+		a6->sin6_family = AF_INET6;
+		a6->sin6_port = htons((u16)port);
+		return PF_INET6;
+	}
+	return 0;
+}
+
+static int quic_test_bind_device(struct sock *sk, char *name)
+{
+	struct net_device *dev;
+	int ifindex;
+
+	if (!name[0])
+		return 0;
+
+	rcu_read_lock();
+	dev = dev_get_by_name_rcu(sock_net(sk), name);
+	if (!dev) {
+		rcu_read_unlock();
+		return -ENODEV;
+	}
+	ifindex = dev->ifindex;
+	rcu_read_unlock();
+
+	return sock_bindtoindex(sk, ifindex, true);
+}
+
+static int quic_test_do_sample_client(void)
+{
+	struct quic_test_priv priv = {};
+	struct sockaddr_storage ra = {};
+	struct socket *sock;
+	int err, family;
+	u32 flags = 0;
+	char msg[64];
+	s64 sid;
+
+	family = quic_test_build_address(&ra);
+	if (!family)
+		return -EINVAL;
+	err = __sock_create(&init_net, family, SOCK_DGRAM, IPPROTO_QUIC, &sock,
+			    1);
+	if (err < 0)
+		return err;
+	/* Allocate file descriptor to expose new socket to userspace. */
+	priv.filp = sock_alloc_file(sock, 0, NULL);
+	if (IS_ERR(priv.filp))
+		return PTR_ERR(priv.filp);
+	err = quic_test_bind_device(sock->sk, dev);
+	if (err)
+		goto free;
+	/* Set ALPN (Application-Layer Protocol Negotiation) on the socket.
+	 *
+	 * This value will be exposed to userspace via
+	 * getsockopt(QUIC_SOCKOPT_ALPN) and used during the TLS handshake
+	 * (e.g., to select HTTP/3 or custom protocol).
+	 *
+	 * Setting this here allows the userspace handshake implementation to
+	 * retrieve and embed the ALPN value in the ClientHello sent to the
+	 * server.
+	 */
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free;
+	err = kernel_connect(sock, (void *)&ra, sizeof(ra), 0);
+	if (err < 0)
+		goto free;
+
+	err = quic_test_client_handshake(sock, &priv);
+	if (err < 0)
+		goto free;
+
+	pr_info("quic_test: handshake completed\n");
+
+	/* Send a message on a new unidirectional stream and then receive a
+	 * response.
+	 *
+	 * - MSG_QUIC_STREAM_NEW tells the stack to open a new stream with
+	 *   given stream ID (sid).  Alternatively, a stream can be opened via
+	 *   getsockopt(QUIC_SOCKOPT_STREAM_OPEN).
+	 *
+	 * - MSG_QUIC_STREAM_FIN marks the end of the stream, signaling no more
+	 *   data will follow.
+	 *
+	 * We send "hello quic server!" on a unidirectional stream
+	 * (QUIC_STREAM_TYPE_UNI_MASK), and expect a response on a
+	 * peer-initiated stream, which we receive with recvmsg().
+	 */
+	strscpy(msg, "hello quic server!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_UNI_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(sock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(sock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	err = 0;
+free:
+	fput(priv.filp);
+	return err;
+}
+
+static int quic_test_do_ticket_client(void)
+{
+	struct quic_transport_param param = {};
+	unsigned int param_len, ticket_len;
+	struct quic_test_priv priv = {};
+	struct sockaddr_storage ra = {};
+	struct quic_config config = {};
+	struct socket *sock;
+	int err, family;
+	u32 flags = 0;
+	char msg[64];
+	s64 sid;
+
+	family = quic_test_build_address(&ra);
+	if (!family)
+		return -EINVAL;
+	err = __sock_create(&init_net, family, SOCK_DGRAM, IPPROTO_QUIC, &sock,
+			    1);
+	if (err < 0)
+		return err;
+	priv.filp = sock_alloc_file(sock, 0, NULL);
+	if (IS_ERR(priv.filp))
+		return PTR_ERR(priv.filp);
+	err = quic_test_bind_device(sock->sk, dev);
+	if (err)
+		goto free;
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free;
+
+	/* Instruct the userspace handshake to capture and provide the session
+	 * ticket during the handshake process via QUIC_SOCKOPT_SESSION_TICKET
+	 * socket option.
+	 */
+	config.receive_session_ticket = 1;
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_CONFIG,
+				 KERNEL_SOCKPTR(&config), sizeof(config));
+	if (err)
+		goto free;
+
+	err = kernel_connect(sock, (void *)&ra, sizeof(ra), 0);
+	if (err < 0)
+		goto free;
+
+	err = quic_test_client_handshake(sock, &priv);
+	if (err < 0)
+		goto free;
+
+	pr_info("quic_test: handshake completed\n");
+
+	/* Retrieve the session ticket from userspace (set via
+	 * setsockopt(QUIC_SOCKOPT_SESSION_TICKET) during the handshake) and
+	 * store it in 'session_data' for later session resumption.
+	 */
+	ticket_len = sizeof(session_data);
+	err = quic_do_getsockopt(sock->sk, QUIC_SOCKOPT_SESSION_TICKET,
+				 KERNEL_SOCKPTR(session_data),
+				 KERNEL_SOCKPTR(&ticket_len));
+	if (err < 0)
+		goto free;
+
+	/* Retrieve and store the server's transport parameters into 'param'.
+	 * These are needed later to enable early data transmission during
+	 * session resumption.
+	 */
+	param_len = sizeof(param);
+	param.remote = 1;
+	err = quic_do_getsockopt(sock->sk, QUIC_SOCKOPT_TRANSPORT_PARAM,
+				 KERNEL_SOCKPTR(&param),
+				 KERNEL_SOCKPTR(&param_len));
+	if (err < 0)
+		goto free;
+
+	pr_info("quic_test: save ticket %d, params %d for resumption\n",
+		ticket_len, param_len);
+
+	strscpy(msg, "hello quic server!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_UNI_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(sock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(sock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	__fput_sync(priv.filp);
+	msleep(100);
+
+	err = __sock_create(&init_net, family, SOCK_DGRAM, IPPROTO_QUIC, &sock,
+			    1);
+	if (err < 0)
+		return err;
+	priv.filp = sock_alloc_file(sock, 0, NULL);
+	if (IS_ERR(priv.filp))
+		return PTR_ERR(priv.filp);
+	err = quic_test_bind_device(sock->sk, dev);
+	if (err)
+		goto free;
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free;
+
+	err = kernel_connect(sock, (void *)&ra, sizeof(ra), 0);
+	if (err < 0)
+		goto free;
+
+	/* Provide the session ticket for resumption. It will be retrieved by
+	 * userspace via getsockopt(QUIC_SOCKOPT_SESSION_TICKET) and used
+	 * during the handshake.
+	 */
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_SESSION_TICKET,
+				 KERNEL_SOCKPTR(session_data), ticket_len);
+	if (err)
+		goto free;
+
+	/* Provide server's transport parameters for early data transmission. */
+	err = quic_do_setsockopt(sock->sk, QUIC_SOCKOPT_TRANSPORT_PARAM,
+				 KERNEL_SOCKPTR(&param), param_len);
+	if (err)
+		goto free;
+
+	/* Queue early application data to be sent before handshake begins. */
+	strscpy(msg, "hello quic server! I'm back!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_UNI_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(sock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	err = quic_test_client_handshake(sock, &priv);
+	if (err < 0)
+		goto free;
+
+	pr_info("quic_test: handshake completed\n");
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(sock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err: %d\n", err);
+		goto free;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	err = 0;
+free:
+	__fput_sync(priv.filp);
+	return err;
+}
+
+static int quic_test_do_sample_server(void)
+{
+	struct quic_test_priv priv = {};
+	struct sockaddr_storage la = {};
+	struct socket *sock, *newsock;
+	int err, family;
+	u32 flags = 0;
+	char msg[64];
+	s64 sid;
+
+	family = quic_test_build_address(&la);
+	if (!family)
+		return -EINVAL;
+	err = __sock_create(&init_net, family, SOCK_DGRAM, IPPROTO_QUIC, &sock,
+			    1);
+	if (err < 0)
+		return err;
+	err = quic_test_bind_device(sock->sk, dev);
+	if (err)
+		goto free;
+
+	err = kernel_bind(sock, (void *)&la, sizeof(la));
+	if (err < 0)
+		goto free;
+	err = kernel_listen(sock, 1);
+	if (err < 0)
+		goto free;
+	err = kernel_accept(sock, &newsock, 0);
+	if (err < 0)
+		goto free;
+
+	priv.filp = sock_alloc_file(newsock, 0, NULL);
+	if (IS_ERR(priv.filp)) {
+		err = PTR_ERR(priv.filp);
+		goto free;
+	}
+
+	err = quic_do_setsockopt(newsock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free_flip;
+
+	err = quic_test_server_handshake(newsock, &priv);
+	if (err < 0)
+		goto free_flip;
+
+	pr_info("quic_test: handshake completed\n");
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(newsock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	strscpy(msg, "hello quic client!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_SERVER_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(newsock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	flags = 0;
+	quic_test_recvmsg(newsock, msg, sizeof(msg) - 1, &sid, &flags);
+	err = 0;
+free_flip:
+	fput(priv.filp);
+free:
+	sock_release(sock);
+	return err;
+}
+
+static int quic_test_do_ticket_server(void)
+{
+	struct quic_test_priv priv = {};
+	struct sockaddr_storage la = {};
+	struct socket *sock, *newsock;
+	int err, family;
+	u32 flags = 0;
+	char msg[64];
+	s64 sid;
+
+	family = quic_test_build_address(&la);
+	if (!family)
+		return -EINVAL;
+	err = __sock_create(&init_net, family, SOCK_DGRAM, IPPROTO_QUIC, &sock,
+			    1);
+	if (err < 0)
+		return err;
+	err = quic_test_bind_device(sock->sk, dev);
+	if (err)
+		goto free;
+
+	err = kernel_bind(sock, (void *)&la, sizeof(la));
+	if (err < 0)
+		goto free;
+	err = kernel_listen(sock, 1);
+	if (err < 0)
+		goto free;
+	err = kernel_accept(sock, &newsock, 0);
+	if (err < 0)
+		goto free;
+
+	priv.filp = sock_alloc_file(newsock, 0, NULL);
+	if (IS_ERR(priv.filp)) {
+		err = PTR_ERR(priv.filp);
+		goto free;
+	}
+
+	err = quic_do_setsockopt(newsock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free_flip;
+
+	err = quic_test_server_handshake(newsock, &priv);
+	if (err < 0)
+		goto free_flip;
+
+	pr_info("quic_test: handshake completed\n");
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(newsock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err: %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	strscpy(msg, "hello quic client!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_SERVER_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(newsock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	__fput_sync(priv.filp);
+
+	pr_info("quic_test: wait for next connection from client...\n");
+
+	err = kernel_accept(sock, &newsock, 0);
+	if (err < 0)
+		goto free;
+
+	priv.filp = sock_alloc_file(newsock, 0, NULL);
+	if (IS_ERR(priv.filp)) {
+		err = PTR_ERR(priv.filp);
+		goto free;
+	}
+
+	err = quic_do_setsockopt(newsock->sk, QUIC_SOCKOPT_ALPN,
+				 KERNEL_SOCKPTR(alpn), strlen(alpn));
+	if (err)
+		goto free_flip;
+
+	err = quic_test_server_handshake(newsock, &priv);
+	if (err < 0)
+		goto free_flip;
+
+	pr_info("quic_test: handshake completed\n");
+
+	memset(msg, 0, sizeof(msg));
+	flags = 0;
+	err = quic_test_recvmsg(newsock, msg, sizeof(msg) - 1, &sid, &flags);
+	if (err < 0) {
+		pr_info("quic_test: recv err: %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: recv '%s' on stream %lld\n", msg, sid);
+
+	strscpy(msg, "hello quic client! welcome back!", sizeof(msg));
+	sid = QUIC_STREAM_TYPE_SERVER_MASK;
+	flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	err = quic_test_sendmsg(newsock, msg, strlen(msg), sid, flags);
+	if (err < 0) {
+		pr_info("quic_test: send err: %d\n", err);
+		goto free_flip;
+	}
+	pr_info("quic_test: send '%s' on stream %lld\n", msg, sid);
+
+	flags = 0;
+	quic_test_recvmsg(newsock, msg, sizeof(msg) - 1, &sid, &flags);
+	err = 0;
+free_flip:
+	__fput_sync(priv.filp);
+free:
+	sock_release(sock);
+	return err;
+}
+
+static int quic_test_init(void)
+{
+	pr_info("quic_test: init\n");
+	if (!strcmp(role, "client")) { /* Run client-side tests. */
+		/* Reuse 'alpn' as test selector: "ticket" for ticket test. */
+		if (!strcmp(alpn, "ticket"))
+			return quic_test_do_ticket_client();
+		/* Otherwise, run sample test. */
+		return quic_test_do_sample_client();
+	}
+	if (!strcmp(role, "server")) { /* Run server-side tests. */
+		if (!strcmp(alpn, "ticket"))
+			return quic_test_do_ticket_server();
+		return quic_test_do_sample_server();
+	}
+	return -EINVAL;
+}
+
+static void quic_test_exit(void)
+{
+	pr_info("quic_test: exit\n");
+}
+
+module_init(quic_test_init);
+module_exit(quic_test_exit);
+
+module_param_string(role, role, ROLE_LEN, 0644);
+module_param_string(alpn, alpn, ALPN_LEN, 0644);
+module_param_string(dev, dev, IFNAMSIZ, 0644);
+module_param_string(ip, ip, IP_LEN, 0644);
+module_param_named(port, port, int, 0644);
+module_param_named(psk, psk, int, 0644);
+
+MODULE_PARM_DESC(role, "Client or server");
+MODULE_PARM_DESC(ip, "Server Address");
+MODULE_PARM_DESC(port, "Server Port");
+MODULE_PARM_DESC(dev, "Device Name");
+MODULE_PARM_DESC(alpn, "ALPN name");
+MODULE_PARM_DESC(psk, "key_serial_t for psk");
+
+MODULE_AUTHOR("Xin Long <lucien.xin@gmail.com>");
+MODULE_DESCRIPTION("Test For Support for the QUIC protocol (RFC9000)");
+MODULE_LICENSE("GPL");
