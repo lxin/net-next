@@ -541,15 +541,607 @@ out:
 	spin_unlock_bh(&head->s_lock);
 }
 
+#define QUIC_MSG_STREAM_FLAGS \
+	(MSG_STREAM_NEW | MSG_STREAM_FIN | MSG_STREAM_UNI | MSG_STREAM_DONTWAIT)
+
+#define QUIC_MSG_FLAGS \
+	(QUIC_MSG_STREAM_FLAGS | MSG_BATCH | MSG_MORE | MSG_DONTWAIT | MSG_DATAGRAM | MSG_NOSIGNAL)
+
+/* Parse control messages and extract stream or handshake metadata from msghdr. */
+static int quic_msghdr_parse(struct sock *sk, struct msghdr *msg, struct quic_handshake_info *hinfo,
+			     struct quic_stream_info *sinfo, bool *has_hinfo)
+{
+	struct quic_handshake_info *h = NULL;
+	struct quic_stream_info *s = NULL;
+	struct quic_stream_table *streams;
+	struct cmsghdr *cmsg;
+	s64 active;
+
+	if (msg->msg_flags & ~QUIC_MSG_FLAGS) /* Reject unsupported flags. */
+		return -EINVAL;
+
+	if (quic_is_closed(sk))
+		return -EPIPE;
+
+	sinfo->stream_id = -1;
+	/* Iterate over control messages and parse recognized QUIC-level metadata. */
+	for_each_cmsghdr(cmsg, msg) {
+		if (!CMSG_OK(msg, cmsg))
+			return -EINVAL;
+
+		if (cmsg->cmsg_level != SOL_QUIC)
+			continue;
+
+		switch (cmsg->cmsg_type) {
+		case QUIC_HANDSHAKE_INFO:
+			if (cmsg->cmsg_len != CMSG_LEN(sizeof(*h)))
+				return -EINVAL;
+			h = CMSG_DATA(cmsg);
+			hinfo->crypto_level = h->crypto_level;
+			break;
+		case QUIC_STREAM_INFO:
+			if (cmsg->cmsg_len != CMSG_LEN(sizeof(*s)))
+				return -EINVAL;
+			s = CMSG_DATA(cmsg);
+			if (s->stream_flags & ~QUIC_MSG_STREAM_FLAGS)
+				return -EINVAL;
+			sinfo->stream_id = s->stream_id;
+			sinfo->stream_flags = s->stream_flags;
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	if (h) { /* If handshake metadata was provided, skip stream handling. */
+		*has_hinfo = true;
+		return 0;
+	}
+
+	if (!s) /* If no stream info was provided, inherit stream_flags from msg_flags. */
+		sinfo->stream_flags |= msg->msg_flags;
+
+	if (sinfo->stream_id != -1)
+		return 0;
+
+	/* No explicit stream, fallback to the active stream (the most recently opened stream). */
+	streams = quic_streams(sk);
+	active = streams->send.active_stream_id;
+	if (active != -1) {
+		sinfo->stream_id = active;
+		return 0;
+	}
+	/* No active stream, pick the next to open based on stream direction. */
+	sinfo->stream_id = streams->send.next_bidi_stream_id;
+	if (sinfo->stream_flags & MSG_STREAM_UNI)
+		sinfo->stream_id = streams->send.next_uni_stream_id;
+	return 0;
+}
+
+/* Returns 1 if stream_id is within allowed limits or 0 otherwise.  If MSG_STREAM_SNDBLOCK is
+ * set, may send a STREAMS_BLOCKED frame.
+ */
+static int quic_sock_stream_available(struct sock *sk, s64 stream_id, u32 flags)
+{
+	struct quic_stream_table *streams = quic_streams(sk);
+	u8 type, blocked;
+
+	if (!quic_stream_id_send_exceeds(streams, stream_id))
+		return 1;
+
+	if (!(flags & MSG_STREAM_SNDBLOCK))
+		return 0;
+
+	blocked = streams->send.bidi_blocked;
+	type = QUIC_FRAME_STREAMS_BLOCKED_BIDI;
+	if (stream_id & QUIC_STREAM_TYPE_UNI_MASK) {
+		blocked = streams->send.uni_blocked;
+		type = QUIC_FRAME_STREAMS_BLOCKED_UNI;
+	}
+
+	if (!blocked)
+		quic_outq_transmit_frame(sk, type, &stream_id, 0, false);
+	return 0;
+}
+
+/* Wait until the given stream ID becomes available for sending. */
+static int quic_wait_for_stream(struct sock *sk, s64 stream_id, u32 flags)
+{
+	long timeo = sock_sndtimeo(sk, flags & MSG_STREAM_DONTWAIT);
+	DEFINE_WAIT(wait);
+	int err = 0;
+
+	for (;;) {
+		prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+		if (quic_is_closed(sk)) {
+			err = -EPIPE;
+			pr_debug("%s: sk closed\n", __func__);
+			break;
+		}
+		if (sk->sk_err) {
+			err = -EPIPE;
+			pr_debug("%s: sk_err: %d\n", __func__, sk->sk_err);
+			break;
+		}
+		if (signal_pending(current)) {
+			err = sock_intr_errno(timeo);
+			break;
+		}
+		if (!timeo) {
+			err = -EAGAIN;
+			break;
+		}
+		if (quic_sock_stream_available(sk, stream_id, flags))
+			break;
+
+		release_sock(sk);
+		timeo = schedule_timeout(timeo);
+		lock_sock(sk);
+	}
+	finish_wait(sk_sleep(sk), &wait);
+	return err;
+}
+
+/* Get the send stream object for the given stream ID.  May wait if the stream isn't
+ * immediately available.
+ */
+static struct quic_stream *quic_sock_send_stream(struct sock *sk, struct quic_stream_info *sinfo)
+{
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_APP);
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream *stream;
+	int err;
+
+	stream = quic_stream_send_get(streams, sinfo->stream_id,
+				      sinfo->stream_flags, quic_is_serv(sk));
+	if (!IS_ERR(stream)) {
+		if (stream->send.state >= QUIC_STREAM_SEND_STATE_SENT)
+			return ERR_PTR(-EINVAL); /* Can't send on a closed or finished stream. */
+		return stream;
+	} else if (PTR_ERR(stream) != -EAGAIN) {
+		return stream;
+	}
+
+	/* App send keys are not ready yet, likely sending 0-RTT data.  Do not wait for stream
+	 * availability if it's beyond the current limit; return an error immediately instead.
+	 */
+	if (!crypto->send_ready)
+		return ERR_PTR(-EINVAL);
+
+	if (!quic_sock_stream_available(sk, sinfo->stream_id, sinfo->stream_flags)) {
+		err = quic_wait_for_stream(sk, sinfo->stream_id, sinfo->stream_flags);
+		if (err)
+			return ERR_PTR(err);
+	}
+
+	/* Stream should now be available, retry getting the stream. */
+	stream = quic_stream_send_get(streams, sinfo->stream_id,
+				      sinfo->stream_flags, quic_is_serv(sk));
+	if (!IS_ERR(stream) && stream->send.state >= QUIC_STREAM_SEND_STATE_SENT)
+		return ERR_PTR(-EINVAL); /* Can't send on a closed or finished stream. */
+	return stream;
+}
+
+/* Wait until send buffer has enough space for sending. */
+static int quic_wait_for_send(struct sock *sk, u32 flags, u32 len)
+{
+	long timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+	DEFINE_WAIT(wait);
+	int err = 0;
+
+	for (;;) {
+		prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+		if (quic_is_closed(sk)) {
+			err = -EPIPE;
+			pr_debug("%s: sk closed\n", __func__);
+			break;
+		}
+		if (sk->sk_err) {
+			err = -EPIPE;
+			pr_debug("%s: sk_err: %d\n", __func__, sk->sk_err);
+			break;
+		}
+		if (signal_pending(current)) {
+			err = sock_intr_errno(timeo);
+			break;
+		}
+		if (!timeo) {
+			err = -EAGAIN;
+			break;
+		}
+		if ((int)len <= sk_stream_wspace(sk) && sk_wmem_schedule(sk, (int)len))
+			break;
+
+		release_sock(sk);
+		timeo = schedule_timeout(timeo);
+		lock_sock(sk);
+	}
+	finish_wait(sk_sleep(sk), &wait);
+	return err;
+}
+
+/* Check if a QUIC stream is writable. */
+static int quic_sock_stream_writable(struct sock *sk, struct quic_stream *stream,
+				     u32 flags, u32 len)
+{
+	/* Check if flow control limits allow sending 'len' bytes. */
+	if (quic_outq_flow_control(sk, stream, len, flags & MSG_STREAM_SNDBLOCK))
+		return 0;
+	/* Check socket send buffer space and memory scheduling capacity. */
+	if (sk_stream_wspace(sk) < len || !sk_wmem_schedule(sk, len))
+		return 0;
+	return 1;
+}
+
+/* Wait until a QUIC stream is writable for sending data. */
+static int quic_wait_for_stream_send(struct sock *sk, struct quic_stream *stream, u32 flags,
+				     u32 len)
+{
+	long timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+	DEFINE_WAIT(wait);
+	int err = 0;
+
+	for (;;) {
+		prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+		if (quic_is_closed(sk)) {
+			err = -EPIPE;
+			pr_debug("%s: sk closed\n", __func__);
+			break;
+		}
+		if (sk->sk_err) {
+			err = -EPIPE;
+			pr_debug("%s: sk_err: %d\n", __func__, sk->sk_err);
+			break;
+		}
+		if (signal_pending(current)) {
+			err = sock_intr_errno(timeo);
+			break;
+		}
+		if (!timeo) {
+			err = -EAGAIN;
+			/* If the stream is blocked due to flow control limits (not socket
+			 * buffer), return ENOSPC instead. This distinction helps applications
+			 * detect when they should switch to sending on other streams (e.g., to
+			 * implement fair scheduling).
+			 */
+			if (quic_outq_wspace(sk, stream) < (u64)len)
+				err = -ENOSPC;
+			break;
+		}
+		if (quic_sock_stream_writable(sk, stream, flags, len))
+			break;
+
+		release_sock(sk);
+		timeo = schedule_timeout(timeo);
+		lock_sock(sk);
+	}
+	finish_wait(sk_sleep(sk), &wait);
+	return err;
+}
+
 static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 {
-	return -EOPNOTSUPP;
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_handshake_info hinfo = {};
+	struct quic_stream_info sinfo = {};
+	int err = 0, bytes = 0, len = 1;
+	bool delay, has_hinfo = false;
+	struct quic_msginfo msginfo;
+	struct quic_crypto *crypto;
+	struct quic_stream *stream;
+	u32 flags = msg->msg_flags;
+	struct quic_frame *frame;
+
+	lock_sock(sk);
+	err = quic_msghdr_parse(sk, msg, &hinfo, &sinfo, &has_hinfo);
+	if (err)
+		goto err;
+
+	delay = !!(flags & MSG_MORE); /* Determine if this is a delayed send. */
+	if (has_hinfo) { /* Handshake Messages Send Path. */
+		/* Initial, Handshake and App (TLS NewSessionTicket) only. */
+		if (hinfo.crypto_level >= QUIC_CRYPTO_EARLY) {
+			err = -EINVAL;
+			goto err;
+		}
+		crypto = quic_crypto(sk, hinfo.crypto_level);
+		if (!crypto->send_ready) { /* Can't send if crypto keys aren't ready. */
+			err = -EINVAL;
+			goto err;
+		}
+		/* Set packet context (overhead, MSS, etc.) before fragmentation. */
+		if (quic_packet_config(sk, hinfo.crypto_level, 0)) {
+			err = -ENETUNREACH;
+			goto err;
+		}
+
+		/* Prepare the message info used by the frame creator. */
+		msginfo.level = hinfo.crypto_level;
+		msginfo.msg = &msg->msg_iter;
+		/* Keep sending until all data from the message iterator is consumed. */
+		while (iov_iter_count(&msg->msg_iter) > 0) {
+			if (sk_stream_wspace(sk) < len || !sk_wmem_schedule(sk, len)) {
+				if (delay) { /* Push buffered data if MSG_MORE was used. */
+					outq->force_delay = 0;
+					quic_outq_transmit(sk);
+				}
+				err = quic_wait_for_send(sk, flags, len);
+				if (err) {
+					/* Return error only if EPIPE or nothing was sent. */
+					if (err == -EPIPE || !bytes)
+						goto err;
+					goto out;
+				}
+			}
+			frame = quic_frame_create(sk, QUIC_FRAME_CRYPTO, &msginfo);
+			if (!frame) {
+				if (!bytes) { /* Return error only if nothing was sent. */
+					err = -ENOMEM;
+					goto err;
+				}
+				goto out;
+			}
+			len = frame->bytes;
+			if (!sk_wmem_schedule(sk, len)) {
+				/* Memory pressure: roll back the iterator and discard the frame. */
+				iov_iter_revert(msginfo.msg, len);
+				quic_frame_put(frame);
+				continue; /* Go back to next frame check with len = frame->bytes. */
+			}
+			bytes += frame->bytes;
+			outq->force_delay = delay; /* Pass the delay flag to outqueue. */
+			crypto->send_offset += frame->bytes; /* Advance crypto offset. */
+			quic_outq_ctrl_tail(sk, frame, delay); /* Queue frame for transmission. */
+			len = 1; /* Reset minimal length guess for next frame check. */
+		}
+		goto out;
+	}
+
+	if (quic_packet_config(sk, QUIC_CRYPTO_APP, 0)) {
+		err = -ENETUNREACH;
+		goto err;
+	}
+
+	if (flags & MSG_DATAGRAM) { /* Datagram Messages Send Path. */
+		if (!outq->max_datagram_frame_size) { /* Peer doesn't allow datagrams. */
+			err = -EINVAL;
+			goto err;
+		}
+		len = iov_iter_count(&msg->msg_iter);
+		if (sk_stream_wspace(sk) < len || !sk_wmem_schedule(sk, len)) {
+			err = quic_wait_for_send(sk, flags, len);
+			if (err)
+				goto err;
+		}
+		/* Only sending Datagram frames with a length field is supported for now. */
+		frame = quic_frame_create(sk, QUIC_FRAME_DATAGRAM_LEN, &msg->msg_iter);
+		if (!frame) {
+			err = -EINVAL;
+			goto err;
+		}
+		bytes += frame->bytes;
+		outq->force_delay = delay;
+		quic_outq_dgram_tail(sk, frame, delay);
+		goto out;
+	}
+
+	/* Stream Messages Send Path. */
+	stream = quic_sock_send_stream(sk, &sinfo);
+	if (IS_ERR(stream)) {
+		err = PTR_ERR(stream);
+		goto err;
+	}
+
+	/* Logic is similar to handshake messages send path. */
+	msginfo.stream = stream;
+	msginfo.msg = &msg->msg_iter;
+	msginfo.flags = sinfo.stream_flags;
+	flags |= sinfo.stream_flags;
+
+	do {
+		if (!quic_sock_stream_writable(sk, stream, flags, len)) {
+			if (delay) {
+				outq->force_delay = 0;
+				quic_outq_transmit(sk);
+			}
+			err = quic_wait_for_stream_send(sk, stream, flags, len);
+			if (err) {
+				if (err == -EPIPE || !bytes)
+					goto err;
+				goto out;
+			}
+		}
+
+		len = quic_outq_stream_append(sk, &msginfo, 0); /* Probe appendable size. */
+		if (len >= 0) {
+			if (!sk_wmem_schedule(sk, len))
+				continue; /* Memory pressure: Retry with new len. */
+			len = quic_outq_stream_append(sk, &msginfo, 1); /* Appended. */
+			if (len >= 0) {
+				bytes += len;
+				len = 1; /* Reset minimal length guess for next frame check. */
+				continue;
+			}
+		}
+
+		frame = quic_frame_create(sk, QUIC_FRAME_STREAM, &msginfo);
+		if (!frame) {
+			if (!bytes) {
+				err = -ENOMEM;
+				goto err;
+			}
+			goto out;
+		}
+		len = frame->bytes;
+		if (!sk_wmem_schedule(sk, len)) {
+			iov_iter_revert(msginfo.msg, len);
+			quic_frame_put(frame);
+			continue;
+		}
+		bytes += frame->bytes;
+		outq->force_delay = delay;
+		quic_outq_stream_tail(sk, frame, delay);
+		len = 1;
+		/* Checking iov_iter_count() after sending allows a FIN-only Stream frame. */
+	} while (iov_iter_count(msginfo.msg) > 0);
+out:
+	err = bytes; /* Return total bytes sent. */
+err:
+	if (err < 0 && !has_hinfo && !(flags & MSG_DATAGRAM))
+		err = sk_stream_error(sk, flags, err); /* Handle error and possibly send SIGPIPE. */
+	release_sock(sk);
+	return err;
+}
+
+/* Wait for an incoming QUIC packet. */
+static int quic_wait_for_packet(struct sock *sk, int nonblock)
+{
+	struct list_head *head = &quic_inq(sk)->recv_list;
+	long timeo = sock_rcvtimeo(sk, nonblock);
+	DEFINE_WAIT(wait);
+	int err = 0;
+
+	for (;;) {
+		if (!list_empty(head))
+			break;
+		prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+		if (quic_is_closed(sk)) {
+			err = -ENOTCONN;
+			pr_debug("%s: sk closed\n", __func__);
+			break;
+		}
+		if (sk->sk_err) {
+			err = -ENOTCONN;
+			pr_debug("%s: sk_err: %d\n", __func__, sk->sk_err);
+			break;
+		}
+		if (signal_pending(current)) {
+			err = sock_intr_errno(timeo);
+			break;
+		}
+		if (!timeo) {
+			err = -EAGAIN;
+			break;
+		}
+
+		release_sock(sk);
+		timeo = schedule_timeout(timeo);
+		lock_sock(sk);
+	}
+	finish_wait(sk_sleep(sk), &wait);
+	return err;
 }
 
 static int quic_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 			int *addr_len)
 {
-	return -EOPNOTSUPP;
+	u32 copy, copied = 0, freed = 0, bytes = 0;
+	struct quic_handshake_info hinfo = {};
+	int nonblock = flags & MSG_DONTWAIT;
+	struct quic_stream_info sinfo = {};
+	struct quic_stream *stream = NULL;
+	struct quic_frame *frame, *next;
+	struct list_head *head;
+	int err, fin;
+
+	lock_sock(sk);
+
+	err = quic_wait_for_packet(sk, nonblock);
+	if (err)
+		goto out;
+
+	head = &quic_inq(sk)->recv_list;
+	/* Iterate over each received frame in the list. */
+	list_for_each_entry_safe(frame, next, head, list) {
+		/* Determine how much data to copy: the minimum of the remaining data in the frame
+		 * and the remaining user buffer space.
+		 */
+		copy = min((u32)(frame->len - frame->offset), (u32)(len - copied));
+		if (copy) { /* Copy data from frame to user message iterator. */
+			copy = copy_to_iter(frame->data + frame->offset, copy, &msg->msg_iter);
+			if (!copy) {
+				if (!copied) { /* Return error only if nothing was coplied. */
+					err = -EFAULT;
+					goto out;
+				}
+				break;
+			}
+			copied += copy; /* Accumulate total copied bytes. */
+		}
+		fin = frame->stream_fin;
+		stream = frame->stream;
+		if (frame->event) {
+			msg->msg_flags |= MSG_NOTIFICATION; /* An Event received. */
+		} else if (frame->level) {
+			/* Attach handshake info control message if crypto level present. */
+			hinfo.crypto_level = frame->level;
+			put_cmsg(msg, SOL_QUIC, QUIC_HANDSHAKE_INFO, sizeof(hinfo), &hinfo);
+			if (msg->msg_flags & MSG_CTRUNC) {
+				err = -EINVAL;
+				goto out;
+			}
+		} else if (frame->dgram) {
+			msg->msg_flags |= MSG_DATAGRAM; /* A Datagram Message received. */
+		}
+		if (flags & MSG_PEEK) /* For peek, only look at first frame, don't consume data. */
+			break;
+		if (copy != frame->len - frame->offset) {
+			/* Partial copy, update offset for next read and exit loop. */
+			frame->offset += copy;
+			break;
+		}
+		msg->msg_flags |= MSG_EOR;
+		bytes += frame->len; /* Track bytes fully consumed. */
+		if (frame->event || frame->level || frame->dgram) {
+			/* For these frame types, only read only one frame at a time. */
+			list_del(&frame->list);
+			quic_frame_put(frame);
+			break;
+		}
+		/* A Stream Message received. */
+		freed += frame->len;
+		list_del(&frame->list);
+		quic_frame_put(frame);
+		if (fin) {
+			/* rfc9000#section-3.2:
+			 *
+			 * Once stream data has been delivered, the stream enters the "Data Read"
+			 * state, which is a terminal state.
+			 */
+			stream->recv.state = QUIC_STREAM_RECV_STATE_READ;
+			sinfo.stream_flags |= MSG_STREAM_FIN;
+			break;
+		}
+
+		/* Stop if next frame is not part of this stream or no more data to copy. */
+		if (list_entry_is_head(next, head, list) || copied >= len)
+			break;
+		if (next->event || next->dgram || !next->stream || next->stream != stream)
+			break;
+	};
+
+	if (stream) {
+		/* Attach stream info control message if stream data was processed. */
+		sinfo.stream_id = stream->id;
+		put_cmsg(msg, SOL_QUIC, QUIC_STREAM_INFO, sizeof(sinfo), &sinfo);
+		if (msg->msg_flags & MSG_CTRUNC)
+			msg->msg_flags |= sinfo.stream_flags;
+
+		/* Update flow control accounting for freed bytes. */
+		quic_inq_flow_control(sk, stream, freed);
+
+		/* If stream read completed, purge and release resources. */
+		if (stream->recv.state == QUIC_STREAM_RECV_STATE_READ) {
+			quic_inq_stream_list_purge(sk, stream);
+			quic_stream_recv_put(quic_streams(sk), stream, quic_is_serv(sk));
+		}
+	}
+
+	quic_inq_data_read(sk, bytes); /* Release receive memory accounting. */
+	err = (int)copied;
+out:
+	release_sock(sk);
+	return err;
 }
 
 /* Wait until a new connection request is available on the listen socket. */
