@@ -197,6 +197,66 @@ struct quic_net *quic_net(struct net *net)
 }
 
 #ifdef CONFIG_PROC_FS
+static int quic_seq_show(struct seq_file *seq, void *v)
+{
+	struct net *net = seq_file_net(seq);
+	u32 hash = (u32)(*(loff_t *)v);
+	struct quic_path_group *paths;
+	struct quic_hash_head *head;
+	struct quic_outqueue *outq;
+	struct sock *sk;
+
+	if (hash >= QUIC_HT_SIZE)
+		return -ENOMEM;
+
+	head = quic_sock_hash(hash);
+	spin_lock_bh(&head->s_lock);
+	sk_for_each(sk, &head->head) {
+		if (net != sock_net(sk))
+			continue;
+
+		paths = quic_paths(sk);
+		quic_seq_dump_addr(seq, quic_path_saddr(paths, 0));
+		quic_seq_dump_addr(seq, quic_path_daddr(paths, 0));
+		quic_seq_dump_addr(seq, quic_path_uaddr(paths, 0));
+
+		outq = quic_outq(sk);
+		seq_printf(seq, "%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", sk->sk_state,
+			   outq->window, quic_packet_mss(quic_packet(sk)),
+			   outq->inflight, READ_ONCE(sk->sk_wmem_queued),
+			   sk_rmem_alloc_get(sk), sk->sk_sndbuf, sk->sk_rcvbuf);
+	}
+	spin_unlock_bh(&head->s_lock);
+	return 0;
+}
+
+static void *quic_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	if (*pos >= QUIC_HT_SIZE)
+		return NULL;
+
+	if (*pos < 0)
+		*pos = 0;
+
+	if (*pos == 0)
+		seq_printf(seq, "LOCAL_ADDRESS\tREMOTE_ADDRESS\tUDP_ADDRESS\tSTATE\t"
+				"WINDOW\tMSS\tIN_FLIGHT\tTX_QUEUE\tRX_QUEUE\tSNDBUF\tRCVBUF\n");
+
+	return (void *)pos;
+}
+
+static void *quic_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	if (++*pos >= QUIC_HT_SIZE)
+		return NULL;
+
+	return pos;
+}
+
+static void quic_seq_stop(struct seq_file *seq, void *v)
+{
+}
+
 static const struct snmp_mib quic_snmp_list[] = {
 	SNMP_MIB_ITEM("QuicConnCurrentEstabs", QUIC_MIB_CONN_CURRENTESTABS),
 	SNMP_MIB_ITEM("QuicConnPassiveEstabs", QUIC_MIB_CONN_PASSIVEESTABS),
@@ -235,6 +295,13 @@ static int quic_snmp_seq_show(struct seq_file *seq, void *v)
 	return 0;
 }
 
+static const struct seq_operations quic_seq_ops = {
+	.show		= quic_seq_show,
+	.start		= quic_seq_start,
+	.next		= quic_seq_next,
+	.stop		= quic_seq_stop,
+};
+
 static int quic_net_proc_init(struct net *net)
 {
 	quic_net(net)->proc_net = proc_net_mkdir(net, "quic", net->proc_net);
@@ -243,6 +310,9 @@ static int quic_net_proc_init(struct net *net)
 
 	if (!proc_create_net_single("snmp", 0444, quic_net(net)->proc_net,
 				    quic_snmp_seq_show, NULL))
+		goto free;
+	if (!proc_create_net("sks", 0444, quic_net(net)->proc_net,
+			     &quic_seq_ops, sizeof(struct seq_net_private)))
 		goto free;
 	return 0;
 free:
