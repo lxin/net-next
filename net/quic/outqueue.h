@@ -61,6 +61,8 @@ struct quic_outqueue {
 void quic_outq_stream_tail(struct sock *sk, struct quic_frame *frame, bool cork);
 void quic_outq_dgram_tail(struct sock *sk, struct quic_frame *frame, bool cork);
 void quic_outq_ctrl_tail(struct sock *sk, struct quic_frame *frame, bool cork);
+void quic_outq_update_path(struct sock *sk, u8 path);
+void quic_outq_transmit_pto(struct sock *sk);
 
 int quic_outq_transmit_frame(struct sock *sk, u8 type, void *data, u8 path, u8 cork);
 int quic_outq_transmit_retire_conn_id(struct sock *sk, u64 prior, u8 path, u8 cork);
@@ -69,13 +71,23 @@ int quic_outq_stream_append(struct sock *sk, struct quic_msginfo *info, u8 pack)
 int quic_outq_probe_path_alt(struct sock *sk, u8 cork);
 int quic_outq_transmit(struct sock *sk);
 
+void quic_outq_transmitted_sack(struct sock *sk, u8 level, s64 largest,
+				s64 smallest, s64 ack_largest, u32 ack_delay);
+void quic_outq_packet_sent_tail(struct sock *sk, struct quic_packet_sent *info);
+void quic_outq_transmitted_tail(struct sock *sk, struct quic_frame *frame);
+void quic_outq_retransmit_list(struct sock *sk, struct list_head *head);
+void quic_outq_retransmit_mark(struct sock *sk, u8 level, u8 immediate);
+void quic_outq_update_loss_timer(struct sock *sk);
+
 void quic_outq_transmit_close(struct sock *sk, u8 frame, u32 errcode, u8 level);
+void quic_outq_stream_list_purge(struct sock *sk, struct quic_stream *stream);
 void quic_outq_encrypted_tail(struct sock *sk, struct sk_buff *skb);
 void quic_outq_transmit_app_close(struct sock *sk);
 void quic_outq_transmit_probe(struct sock *sk);
 
 void quic_outq_get_param(struct sock *sk, struct quic_transport_param *p);
 void quic_outq_set_param(struct sock *sk, struct quic_transport_param *p);
+void quic_outq_sync_window(struct sock *sk, u32 window);
 void quic_outq_init(struct sock *sk);
 void quic_outq_free(struct sock *sk);
 

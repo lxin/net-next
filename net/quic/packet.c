@@ -189,6 +189,10 @@ void quic_packet_rcv_err_pmtu(struct sock *sk)
 		dst = __sk_dst_get(sk);
 		dst->ops->update_pmtu(dst, sk, NULL, info, true);
 		quic_packet_mss_update(sk, info - packet->hlen);
+		/* Retransmit all outstanding data as MTU may have increased. */
+		quic_outq_retransmit_mark(sk, QUIC_CRYPTO_APP, 1);
+		quic_outq_update_loss_timer(sk);
+		quic_outq_transmit(sk);
 		return;
 	}
 	/* PLPMTUD is enabled: adjust to smaller PMTU, subtract headers and AEAD tag.  Also
@@ -631,10 +635,22 @@ static struct sk_buff *quic_packet_app_create(struct sock *sk)
 void quic_packet_mss_update(struct sock *sk, u32 mss)
 {
 	struct quic_packet *packet = quic_packet(sk);
+	struct quic_outqueue *outq = quic_outq(sk);
 	struct quic_cong *cong = quic_cong(sk);
 
+	/* Limit MSS for regular QUIC packets to the max UDP payload size. */
+	if (outq->max_udp_payload_size && mss > outq->max_udp_payload_size)
+		mss = outq->max_udp_payload_size;
 	packet->mss[0] = (u16)mss;
+
+	/* Update congestion control with new payload space (excluding tag). */
 	quic_cong_set_mss(cong, packet->mss[0] - packet->taglen[0]);
+	quic_outq_sync_window(sk, cong->window);
+
+	/* Limit MSS for DATAGRAM frame packets to the max datagram frame size. */
+	if (outq->max_datagram_frame_size && mss > outq->max_datagram_frame_size)
+		mss = outq->max_datagram_frame_size;
+	packet->mss[1] = (u16)mss;
 }
 
 /* Perform routing for the QUIC packet on the specified path, update header length and MSS

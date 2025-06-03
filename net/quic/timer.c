@@ -36,6 +36,10 @@ out:
 
 void quic_timer_loss_handler(struct sock *sk)
 {
+	if (quic_is_closed(sk))
+		return;
+
+	quic_outq_transmit_pto(sk);
 }
 
 static void quic_timer_loss_timeout(struct timer_list *t)
