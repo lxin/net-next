@@ -25,6 +25,7 @@
 
 #include "protocol.h"
 #include "outqueue.h"
+#include "inqueue.h"
 #include "timer.h"
 
 extern struct proto quic_prot;
@@ -80,6 +81,7 @@ struct quic_sock {
 	struct quic_crypto		crypto[QUIC_CRYPTO_MAX];
 
 	struct quic_outqueue		outq;
+	struct quic_inqueue		inq;
 	struct quic_packet		packet;
 	struct quic_timer		timers[QUIC_TIMER_MAX];
 };
@@ -162,6 +164,11 @@ static inline struct quic_crypto *quic_crypto(const struct sock *sk, u8 level)
 static inline struct quic_outqueue *quic_outq(const struct sock *sk)
 {
 	return &quic_sk(sk)->outq;
+}
+
+static inline struct quic_inqueue *quic_inq(const struct sock *sk)
+{
+	return &quic_sk(sk)->inq;
 }
 
 static inline struct quic_packet *quic_packet(const struct sock *sk)

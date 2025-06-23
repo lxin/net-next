@@ -21,6 +21,7 @@
 
 static unsigned int quic_net_id __read_mostly;
 
+struct quic_transport_param quic_default_param __read_mostly;
 struct kmem_cache *quic_frame_cachep __read_mostly;
 struct percpu_counter quic_sockets_allocated;
 
@@ -146,6 +147,23 @@ static void quic_net_proc_exit(struct net *net)
 	quic_net(net)->proc_net = NULL;
 }
 #endif
+
+static void quic_transport_param_init(void)
+{
+	struct quic_transport_param *p = &quic_default_param;
+
+	p->max_udp_payload_size = QUIC_MAX_UDP_PAYLOAD;
+	p->ack_delay_exponent = QUIC_DEF_ACK_DELAY_EXPONENT;
+	p->max_ack_delay = QUIC_DEF_ACK_DELAY;
+	p->active_connection_id_limit = QUIC_CONN_ID_DEF;
+	p->max_idle_timeout = QUIC_DEF_IDLE_TIMEOUT;
+	p->max_data = (u64)QUIC_PATH_MAX_PMTU * 32;
+	p->max_stream_data_bidi_local = (u64)QUIC_PATH_MAX_PMTU * 16;
+	p->max_stream_data_bidi_remote = (u64)QUIC_PATH_MAX_PMTU * 16;
+	p->max_stream_data_uni = (u64)QUIC_PATH_MAX_PMTU * 16;
+	p->max_streams_bidi = QUIC_DEF_STREAMS;
+	p->max_streams_uni = QUIC_DEF_STREAMS;
+}
 
 static const struct proto_ops quic_proto_ops = {
 	.family		   = PF_INET,
@@ -334,6 +352,7 @@ static __init int quic_init(void)
 	sysctl_quic_wmem[1] = 16 * 1024;
 	sysctl_quic_wmem[2] = max(64 * 1024, max_share);
 
+	quic_transport_param_init();
 	quic_crypto_init();
 
 	quic_frame_cachep = kmem_cache_create("quic_frame", sizeof(struct quic_frame),
