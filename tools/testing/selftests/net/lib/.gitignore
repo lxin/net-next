@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+csum
+gro
+xdp_helper
+xsk_xdp_progs.skel.h
+xskxceiver
