@@ -258,9 +258,18 @@ static int __net_init quic_net_init(struct net *net)
 	if (!qn->stat)
 		return -ENOMEM;
 
+	err = quic_crypto_set_cipher(&qn->crypto, TLS_CIPHER_AES_GCM_128, CRYPTO_ALG_ASYNC);
+	if (err) {
+		free_percpu(qn->stat);
+		qn->stat = NULL;
+		return err;
+	}
+	spin_lock_init(&qn->lock);
+
 #ifdef CONFIG_PROC_FS
 	err = quic_net_proc_init(net);
 	if (err) {
+		quic_crypto_free(&qn->crypto);
 		free_percpu(qn->stat);
 		qn->stat = NULL;
 	}
@@ -275,6 +284,7 @@ static void __net_exit quic_net_exit(struct net *net)
 #ifdef CONFIG_PROC_FS
 	quic_net_proc_exit(net);
 #endif
+	quic_crypto_free(&qn->crypto);
 	free_percpu(qn->stat);
 	qn->stat = NULL;
 }
@@ -322,6 +332,8 @@ static __init int quic_init(void)
 	sysctl_quic_wmem[0] = PAGE_SIZE;
 	sysctl_quic_wmem[1] = 16 * 1024;
 	sysctl_quic_wmem[2] = max(64 * 1024, max_share);
+
+	quic_crypto_init();
 
 	err = percpu_counter_init(&quic_sockets_allocated, 0, GFP_KERNEL);
 	if (err)

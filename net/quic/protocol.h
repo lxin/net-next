@@ -47,6 +47,8 @@ struct quic_net {
 #ifdef CONFIG_PROC_FS
 	struct proc_dir_entry *proc_net;	/* procfs entry for dumping QUIC socket stats */
 #endif
+	struct quic_crypto crypto;	/* Context for decrypting Initial packets for ALPN */
+	spinlock_t lock;	/* Lock protecting crypto context for Initial packet decryption */
 };
 
 struct quic_net *quic_net(struct net *net);
