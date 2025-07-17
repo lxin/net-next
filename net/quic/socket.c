@@ -25,6 +25,105 @@ static void quic_enter_memory_pressure(struct sock *sk)
 	WRITE_ONCE(quic_memory_pressure, 1);
 }
 
+/* Check if a matching request sock already exists.  Match is based on source/destination
+ * addresses and DCID.
+ */
+struct quic_request_sock *quic_request_sock_lookup(struct sock *sk)
+{
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_request_sock *req;
+
+	list_for_each_entry(req, quic_reqs(sk), list) {
+		if (!memcmp(&req->saddr, &packet->saddr, sizeof(req->saddr)) &&
+		    !memcmp(&req->daddr, &packet->daddr, sizeof(req->daddr)) &&
+		    !quic_conn_id_cmp(&req->dcid, &packet->dcid))
+			return req;
+	}
+	return NULL;
+}
+
+/* Create and enqueue a QUIC request sock for a new incoming connection. */
+struct quic_request_sock *quic_request_sock_enqueue(struct sock *sk, struct quic_conn_id *odcid,
+						    u8 retry)
+{
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_request_sock *req;
+
+	if (sk_acceptq_is_full(sk)) /* Refuse new request if the accept queue is full. */
+		return NULL;
+
+	req = kzalloc(sizeof(*req), GFP_ATOMIC);
+	if (!req)
+		return NULL;
+
+	req->version = packet->version;
+	req->daddr = packet->daddr;
+	req->saddr = packet->saddr;
+	req->scid = packet->scid;
+	req->dcid = packet->dcid;
+	req->orig_dcid = *odcid;
+	req->retry = retry;
+
+	skb_queue_head_init(&req->backlog_list);
+
+	/* Enqueue request into the listen socket’s pending list for accept(). */
+	list_add_tail(&req->list, quic_reqs(sk));
+	sk_acceptq_added(sk);
+	return req;
+}
+
+int quic_request_sock_backlog_tail(struct sock *sk, struct quic_request_sock *req,
+				   struct sk_buff *skb)
+{
+	/* Use listen sock sk_rcvbuf to limit the request sock's backlog len. */
+	if (req->blen + skb->len > sk->sk_rcvbuf)
+		return -ENOMEM;
+
+	__skb_queue_tail(&req->backlog_list, skb);
+	req->blen += skb->len;
+	sk->sk_data_ready(sk);
+	return 0;
+}
+
+/* Check if a matching accept socket exists.  This is needed because an accept socket
+ * might have been created after this packet was enqueued in the listen socket's backlog.
+ */
+bool quic_accept_sock_exists(struct sock *sk, struct sk_buff *skb)
+{
+	struct quic_pnspace *space = quic_pnspace(sk, QUIC_CRYPTO_INITIAL);
+	struct quic_packet *packet = quic_packet(sk);
+	bool exist = false;
+
+	/* Skip if packet is newer than the last accept socket creation time.  No matching
+	 * socket could exist in this case.
+	 */
+	if (QUIC_SKB_CB(skb)->time > space->time)
+		return exist;
+
+	/* Look up an accepted socket that matches the packet's addresses and DCID. */
+	local_bh_disable();
+	sk = quic_sock_lookup(skb, &packet->saddr, &packet->daddr, &packet->dcid);
+	if (!sk)
+		goto out;
+
+	/* Found a matching accept socket. Process the packet with this socket. */
+	bh_lock_sock(sk);
+	if (sock_owned_by_user(sk)) {
+		/* Socket is busy (owned by user context): queue to backlog. */
+		if (sk_add_backlog(sk, skb, READ_ONCE(sk->sk_rcvbuf)))
+			kfree_skb(skb);
+	} else {
+		/* Socket not busy: process immediately. */
+		sk->sk_backlog_rcv(sk, skb); /* quic_packet_process(). */
+	}
+	bh_unlock_sock(sk);
+	sock_put(sk);
+	exist = true;
+out:
+	local_bh_enable();
+	return exist;
+}
+
 /* Lookup a connected QUIC socket based on address and dest connection ID.
  *
  * This function searches the established (non-listening) QUIC socket table for a socket that

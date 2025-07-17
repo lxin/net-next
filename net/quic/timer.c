@@ -14,6 +14,29 @@
 
 void quic_timer_sack_handler(struct sock *sk)
 {
+	struct quic_pnspace *space = quic_pnspace(sk, QUIC_CRYPTO_APP);
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_connection_close close = {};
+
+	if (quic_is_closed(sk))
+		return;
+
+	if (inq->sack_flag == QUIC_SACK_FLAG_NONE) { /* Idle timer expired, close the connection. */
+		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_CLOSE, &close);
+		quic_set_state(sk, QUIC_SS_CLOSED);
+
+		pr_debug("%s: idle timeout\n", __func__);
+		return;
+	}
+
+	if (inq->sack_flag == QUIC_SACK_FLAG_APP) {
+		space->need_sack = 1; /* Request an APP-level ACK frame to be generated. */
+		space->sack_path = 0; /* Send delayed ACK only on the active path. */
+	}
+
+	quic_outq_transmit(sk); /* Transmit necessary frames, including ACKs or others queued. */
+	inq->sack_flag = QUIC_SACK_FLAG_NONE; /* Start as idle timer. */
+	quic_timer_start(sk, QUIC_TIMER_IDLE, inq->timeout);
 }
 
 static void quic_timer_sack_timeout(struct timer_list *t)
