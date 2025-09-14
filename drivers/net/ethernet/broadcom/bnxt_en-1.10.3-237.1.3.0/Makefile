@@ -1460,6 +1460,10 @@ ifneq ($(shell grep -so "tls_driver_ctx" $(LINUXSRC)/include/net/tls.h),)
   endif
 endif
 
+ifneq ($(shell ls $(LINUXSRC)/include/linux/quic_offload.h > /dev/null 2>&1 && echo quic_offload),)
+  DISTRO_CFLAG += -DHAVE_QUIC_OFFLOAD
+endif
+
 ifneq ($(shell grep -so "hwmon_notify_event" $(LINUXSRC)/include/linux/hwmon.h),)
   DISTRO_CFLAG += -DHAVE_HWMON_NOTIFY_EVENT
 endif

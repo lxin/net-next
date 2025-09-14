@@ -19,6 +19,10 @@
 
 #ifdef HAVE_BNXT_QUIC
 
+#ifdef HAVE_QUIC_OFFLOAD
+#include <linux/quic_offload.h>
+#endif
+
 struct bnxt_quic_crypto_info quic_flow;
 
 static inline unsigned int quic_flow_hash_v4(__be32 src_ip, __be32 dst_ip,
@@ -98,7 +102,7 @@ struct sk_buff *bnxt_quic_xmit(struct bnxt *bp, struct bnxt_tx_ring_info *txr,
 	struct udphdr *udph = udp_hdr(skb);
 
 	/* Check if flow is programmed. */
-	if (quic) {
+	if (quic && skb->decrypted) { /* Packet not encrypted by QUIC stack. */
 		if (skb->protocol == htons(ETH_P_IP)) {
 			struct iphdr *ip4h = ip_hdr(skb);
 
@@ -580,6 +584,107 @@ void bnxt_free_quic_info(struct bnxt *bp)
 	bp->quic_info = NULL;
 }
 
+#ifdef HAVE_QUIC_OFFLOAD
+static int bnxt_quic_dev_flow_add(struct net_device *dev,
+				  enum quic_crypto_dir dir, struct quic_crypto_info *info)
+{
+	struct bnxt_quic_crypto_info *quic_flow = NULL;
+	struct bnxt_quic_connection_info *flow_info;
+	struct bnxt *bp = netdev_priv(dev);
+	__be16 sport, dport;
+
+	if (dir != QUIC_CRYPTO_DIR_TX || info->conn_id_len > sizeof(u64))
+		return -EOPNOTSUPP;
+
+	if (info->daddr.ss_family == AF_INET) {
+		struct sockaddr_in *src = (struct sockaddr_in *)&info->saddr;
+		struct sockaddr_in *dst = (struct sockaddr_in *)&info->daddr;
+
+		sport = src->sin_port;
+		dport = dst->sin_port;
+		quic_flow = bnxt_quic_flow_lookup_v4(bp, src->sin_addr.s_addr, dst->sin_addr.s_addr,
+						     sport, dport);
+	} else if (info->daddr.ss_family == AF_INET6) {
+		struct sockaddr_in6 *src = (struct sockaddr_in6 *)&info->saddr;
+		struct sockaddr_in6 *dst = (struct sockaddr_in6 *)&info->daddr;
+
+		sport = src->sin6_port;
+		dport = dst->sin6_port;
+		quic_flow = bnxt_quic_flow_lookup_v6(bp, &src->sin6_addr, &dst->sin6_addr,
+						     sport, dport);
+	}
+
+	if (quic_flow) {
+		netdev_info(bp->dev, "%s(): Flow already present in database!\n", __func__);
+		kfree(quic_flow);
+		return -EEXIST;
+	}
+
+	quic_flow = kzalloc(sizeof(*quic_flow), GFP_KERNEL);
+	if (!quic_flow)
+		return -ENOMEM;
+
+	flow_info = &quic_flow->connection_info;
+	flow_info->offload_dir = TLS_OFFLOAD_CTX_DIR_TX;
+	memcpy(&flow_info->tx_conn_id, info->conn_id, info->conn_id_len);
+	flow_info->dst_conn_id_width = info->conn_id_len;
+
+	flow_info->cipher = info->cipher;
+	memcpy(flow_info->tx_data_key, info->data_key, BNXT_MAX_KEY_SIZE);
+	memcpy(flow_info->tx_hdr_key, info->hdr_key, BNXT_MAX_KEY_SIZE);
+	memcpy(flow_info->tx_iv, info->iv, BNXT_IV_SIZE);
+
+	flow_info->family = info->daddr.ss_family;
+	flow_info->daddr = info->daddr;
+	flow_info->saddr = info->saddr;
+	flow_info->sport = sport;
+	flow_info->dport = dport;
+
+	quic_flow->bp = bp;
+	return bnxt_quic_dev_add(quic_flow);
+}
+
+static void bnxt_quic_dev_flow_del(struct net_device *dev,
+				   enum quic_crypto_dir dir, struct quic_crypto_info *info)
+{
+	struct bnxt_quic_crypto_info *quic_flow = NULL;
+	struct bnxt *bp = netdev_priv(dev);
+	struct bnxt_tls_info *quic;
+
+	if (dir != QUIC_CRYPTO_DIR_TX)
+		return;
+
+	if (info->daddr.ss_family == AF_INET) {
+		struct sockaddr_in *src = (struct sockaddr_in *)&info->saddr;
+		struct sockaddr_in *dst = (struct sockaddr_in *)&info->daddr;
+
+		quic_flow = bnxt_quic_flow_lookup_v4(bp, src->sin_addr.s_addr, dst->sin_addr.s_addr,
+						     htons(src->sin_port), htons(dst->sin_port));
+	} else if (info->daddr.ss_family == AF_INET6) {
+		struct sockaddr_in6 *src = (struct sockaddr_in6 *)&info->saddr;
+		struct sockaddr_in6 *dst = (struct sockaddr_in6 *)&info->daddr;
+
+		quic_flow = bnxt_quic_flow_lookup_v6(bp, &src->sin6_addr, &dst->sin6_addr,
+						     htons(src->sin6_port), htons(dst->sin6_port));
+	}
+
+	if (!quic_flow)
+		return;
+
+	quic = bp->quic_info;
+	spin_lock_bh(&quic->quic_fltr_lock);
+	hash_del_rcu(&quic_flow->node);
+	spin_unlock_bh(&quic->quic_fltr_lock);
+	synchronize_rcu();
+	bnxt_quic_dev_del(quic_flow);
+}
+
+static const struct quicdev_ops bnxt_quic_ops = {
+	.quic_dev_add = bnxt_quic_dev_flow_add,
+	.quic_dev_del = bnxt_quic_dev_flow_del,
+};
+#endif
+
 int bnxt_quic_init(struct bnxt *bp)
 {
 	struct bnxt_hw_resc *hw_resc = &bp->hw_resc;
@@ -618,6 +723,10 @@ int bnxt_quic_init(struct bnxt *bp)
 					    0, 0, NULL);
 	if (!quic->mpc_cache)
 		return -ENOMEM;
+
+#ifdef HAVE_QUIC_OFFLOAD
+	bp->dev->quicdev_ops = &bnxt_quic_ops;
+#endif
 	return 0;
 }
 
