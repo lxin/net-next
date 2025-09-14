@@ -1448,7 +1448,6 @@ void bnxt_ktls_rx(struct bnxt *bp, struct sk_buff *skb, u8 *data_ptr,
 			}
 			th = (struct tcphdr *)nextp;
 			sk = __inet6_lookup_established(net,
-					net->ipv4.tcp_death_row.hashinfo,
 					&ip6h->saddr, th->source, &ip6h->daddr,
 					ntohs(th->dest), dev->ifindex, 0);
 		} else {
@@ -1456,7 +1455,6 @@ void bnxt_ktls_rx(struct bnxt *bp, struct sk_buff *skb, u8 *data_ptr,
 
 			th = (struct tcphdr *)(l3_ptr + iph->ihl * 4);
 			sk = inet_lookup_established(net,
-					net->ipv4.tcp_death_row.hashinfo,
 					iph->saddr, th->source, iph->daddr,
 					th->dest, dev->ifindex);
 		}

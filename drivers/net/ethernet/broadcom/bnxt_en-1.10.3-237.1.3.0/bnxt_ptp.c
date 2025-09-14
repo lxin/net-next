@@ -894,7 +894,7 @@ static void bnxt_unmap_ptp_regs(struct bnxt *bp)
 		writel(0, bp->bar0 + BNXT_GRCPF_REG_WINDOW_BASE_OUT + 16);
 }
 
-static u64 bnxt_cc_read(const struct cyclecounter *cc)
+static u64 bnxt_cc_read(struct cyclecounter *cc)
 {
 	struct bnxt_ptp_cfg *ptp = container_of(cc, struct bnxt_ptp_cfg, cc);
 	u64 ns = 0;

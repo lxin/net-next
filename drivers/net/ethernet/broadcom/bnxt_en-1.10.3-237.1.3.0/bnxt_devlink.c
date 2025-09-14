@@ -596,9 +596,9 @@ __bnxt_dl_reporter_create(struct bnxt *bp,
 	struct devlink_health_reporter *reporter;
 
 #ifndef HAVE_DEVLINK_HEALTH_AUTO_RECOVER
-	reporter = devlink_health_reporter_create(bp->dl, ops, 0, bp);
+	reporter = devlink_health_reporter_create(bp->dl, ops, bp);
 #else
-	reporter = devlink_health_reporter_create(bp->dl, ops, 0,
+	reporter = devlink_health_reporter_create(bp->dl, ops,
 						  !!ops->recover, bp);
 #endif
 	if (IS_ERR(reporter)) {
