@@ -1040,6 +1040,7 @@ struct dev_ifalias {
 
 struct devlink;
 struct tlsdev_ops;
+struct quicdev_ops;
 
 struct netdev_net_notifier {
 	struct list_head list;
@@ -2237,6 +2238,8 @@ struct net_device {
 #if IS_ENABLED(CONFIG_TLS_DEVICE)
 	const struct tlsdev_ops *tlsdev_ops;
 #endif
+
+	const struct quicdev_ops *quicdev_ops;
 
 	unsigned int		operstate;
 	unsigned char		link_mode;
