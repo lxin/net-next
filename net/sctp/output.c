@@ -58,6 +58,8 @@ static void sctp_packet_reset(struct sctp_packet *packet)
 	 * current overhead after sending packets.
 	 */
 	packet->size = packet->overhead;
+	if (packet->dtls_hdr_size)
+		packet->size += SCTP_DTLS_OVERHEAD;
 
 	packet->has_cookie_echo = 0;
 	packet->has_sack = 0;
@@ -71,11 +73,12 @@ static void sctp_packet_reset(struct sctp_packet *packet)
  * This appears to be a followup set of initializations.
  */
 void sctp_packet_config(struct sctp_packet *packet, __u32 vtag,
-			int ecn_capable)
+			int ecn_capable, int is_init)
 {
 	struct sctp_transport *tp = packet->transport;
 	struct sctp_association *asoc = tp->asoc;
 	struct sctp_sock *sp = NULL;
+	struct sctp_crypto *crypto;
 	struct sock *sk;
 
 	pr_debug("%s: packet:%p vtag:0x%x\n", __func__, packet, vtag);
@@ -134,9 +137,19 @@ void sctp_packet_config(struct sctp_packet *packet, __u32 vtag,
 		dst_hold(tp->dst);
 		sk_setup_caps(sk, tp->dst);
 	}
-	packet->max_size = sk_can_gso(sk) ? min(READ_ONCE(tp->dst->dev->gso_max_size),
-						GSO_LEGACY_MAX_SIZE)
-					  : asoc->pathmtu;
+	packet->max_size = asoc->pathmtu;
+
+	crypto = asoc->dtls.send_crypto[SCTP_CRYPTO_DATA];
+	if (!crypto && !is_init && sctp_kmp_has_restart(&asoc->dtls.chosen_kmp))
+		crypto = asoc->dtls.send_crypto[SCTP_CRYPTO_RESTART];
+	if (crypto) { /* Account for DTLS chunk and record header overhead. */
+		/* Include Pre-padding in dtls_hdr_size. */
+		packet->size += SCTP_DTLS_OVERHEAD;
+		packet->dtls_hdr_size = SCTP_DTLS_HEAD;
+	} else if (sk_can_gso(sk)) {
+		packet->max_size = min(READ_ONCE(tp->dst->dev->gso_max_size),
+				       GSO_LEGACY_MAX_SIZE);
+	}
 	rcu_read_unlock();
 }
 
@@ -450,6 +463,20 @@ static int sctp_packet_pack(struct sctp_packet *packet,
 	} else {
 		nskb = head;
 		pkt_size = packet->size;
+		if (packet->dtls_hdr_size) {
+			struct sctp_chunkhdr *ch =
+				skb_put(nskb, packet->dtls_hdr_size);
+
+			/* Pack the DTLS chunk header; record header will be
+			 * encoded later.
+			 */
+			ch->type = SCTP_CID_DTLS;
+			if (!tp->asoc->dtls.send_crypto[SCTP_CRYPTO_DATA])
+				ch->flags = SCTP_CHUNK_FLAG_R;
+			else
+				ch->flags = 0;
+			pkt_size -= packet->dtls_hdr_size;
+		}
 		goto merge;
 	}
 
@@ -538,27 +565,68 @@ merge:
 					sizeof(struct inet6_skb_parm)));
 		skb_shinfo(head)->gso_segs = pkt_count;
 		skb_shinfo(head)->gso_size = GSO_BY_FRAGS;
-		goto chksum;
-	}
-
-	if (sctp_checksum_disable)
-		return 1;
-
-	if (!(tp->dst->dev->features & NETIF_F_SCTP_CRC) ||
-	    dst_xfrm(tp->dst) || packet->ipfragok || tp->encap_port) {
-		struct sctphdr *sh =
-			(struct sctphdr *)skb_transport_header(head);
-
-		sh->checksum = sctp_compute_cksum(head, 0);
-	} else {
-chksum:
-		head->ip_summed = CHECKSUM_PARTIAL;
-		head->csum_not_inet = 1;
-		head->csum_start = skb_transport_header(head) - head->head;
-		head->csum_offset = offsetof(struct sctphdr, checksum);
 	}
 
 	return pkt_count;
+}
+
+static void sctp_packet_transmit_dlts_cb(void *data, int err);
+
+static void __sctp_packet_transmit(struct sk_buff *skb,
+				   struct sctp_transport *tp,
+				   gfp_t gfp, u8 has_dtls, u8 resume)
+{
+	int err;
+
+	if (has_dtls) {
+		if (tp->dead || !tp->dst) {
+			kfree_skb(skb);
+			return;
+		}
+		err = sctp_dtls_encode_record(&tp->asoc->dtls, skb,
+					      sctp_packet_transmit_dlts_cb,
+					      gfp, resume);
+		if (err == -EINPROGRESS) {
+			SCTP_OUTPUT_CB(skb)->tp = tp;
+			sctp_transport_hold(tp);
+			return;
+		}
+		if (err) {
+			kfree_skb(skb);
+			return;
+		}
+	}
+
+	if (skb_is_gso(skb))
+		goto chksum;
+
+	if (sctp_checksum_disable)
+		goto out;
+
+	if (!(tp->dst->dev->features & NETIF_F_SCTP_CRC) ||
+	     dst_xfrm(tp->dst) || skb->ignore_df || tp->encap_port) {
+		struct sctphdr *sh =
+			(struct sctphdr *)skb_transport_header(skb);
+
+		sh->checksum = sctp_compute_cksum(skb, 0);
+	} else {
+chksum:
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		skb->csum_not_inet = 1;
+		skb->csum_start = skb_transport_header(skb) - skb->head;
+		skb->csum_offset = offsetof(struct sctphdr, checksum);
+	}
+
+out:
+	if (tp->dst_pending_confirm)
+		skb_set_dst_pending_confirm(skb, 1);
+
+	/* neighbour should be confirmed on successful transmission or
+	 * positive error
+	 */
+	if (tp->af_specific->sctp_xmit(skb, tp) >= 0 &&
+	    tp->dst_pending_confirm)
+		tp->dst_pending_confirm = 0;
 }
 
 /* All packets are sent to the network through this function from
@@ -645,14 +713,8 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
 			asoc->peer.last_sent_to = tp;
 	}
 	head->ignore_df = packet->ipfragok;
-	if (tp->dst_pending_confirm)
-		skb_set_dst_pending_confirm(head, 1);
-	/* neighbour should be confirmed on successful transmission or
-	 * positive error
-	 */
-	if (tp->af_specific->sctp_xmit(head, tp) >= 0 &&
-	    tp->dst_pending_confirm)
-		tp->dst_pending_confirm = 0;
+
+	__sctp_packet_transmit(head, tp, gfp, !!packet->dtls_hdr_size, 0);
 
 out:
 	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
@@ -662,6 +724,31 @@ out:
 	}
 	sctp_packet_reset(packet);
 	return 0;
+}
+
+static void sctp_packet_transmit_dlts_cb(void *data, int err)
+{
+	struct sk_buff *skb = data;
+	struct sctp_transport *tp;
+	struct sock *sk = skb->sk;
+
+	if (err == -EINPROGRESS)
+		return;
+
+	kfree_sensitive(SCTP_OUTPUT_CB(skb)->crypto_ctx);
+
+	tp = SCTP_OUTPUT_CB(skb)->tp;
+	if (err) {
+		kfree_skb(skb);
+		goto out;
+	}
+
+	lock_sock(sk);
+	__sctp_packet_transmit(skb, tp, GFP_KERNEL, 1, 1);
+	release_sock(sk);
+
+out:
+	sctp_transport_put(tp);
 }
 
 /********************************************************************

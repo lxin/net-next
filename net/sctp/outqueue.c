@@ -771,10 +771,12 @@ static int sctp_packet_singleton(struct sctp_transport *transport,
 	const __u16 sport = asoc->base.bind_addr.port;
 	const __u16 dport = asoc->peer.port;
 	const __u32 vtag = asoc->peer.i.init_tag;
+	u8 type = chunk->chunk_hdr->type;
 	struct sctp_packet singleton;
 
 	sctp_packet_init(&singleton, transport, sport, dport);
-	sctp_packet_config(&singleton, vtag, 0);
+	sctp_packet_config(&singleton, vtag, 0, (type == SCTP_CID_INIT ||
+						 type == SCTP_CID_INIT_ACK));
 	if (sctp_packet_append_chunk(&singleton, chunk) != SCTP_XMIT_OK) {
 		list_del_init(&chunk->list);
 		sctp_chunk_free(chunk);
@@ -868,7 +870,7 @@ static void sctp_outq_select_transport(struct sctp_flush_ctx *ctx,
 
 		sctp_packet_config(ctx->packet,
 				   ctx->asoc->peer.i.init_tag,
-				   ctx->asoc->peer.ecn_capable);
+				   ctx->asoc->peer.ecn_capable, 0);
 		/* We've switched transports, so apply the
 		 * Burst limit to the new transport.
 		 */
@@ -1006,7 +1008,7 @@ static bool sctp_outq_flush_rtx(struct sctp_flush_ctx *ctx,
 				      &ctx->transport_list);
 
 		sctp_packet_config(ctx->packet, ctx->asoc->peer.i.init_tag,
-				   ctx->asoc->peer.ecn_capable);
+				   ctx->asoc->peer.ecn_capable, 0);
 	}
 
 	error = __sctp_outq_flush_rtx(ctx->q, ctx->packet, rtx_timeout,

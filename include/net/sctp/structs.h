@@ -708,6 +708,8 @@ struct sctp_packet {
 	size_t size;
 	/* This is the maximum size this packet may have */
 	size_t max_size;
+	/* This is the DTLS header size in a DTLS Chunk */
+	size_t dtls_hdr_size;
 
 	/* The packet is destined for this transport address.
 	 * The function we finally use to pass down to the next lower
@@ -727,7 +729,8 @@ struct sctp_packet {
 
 void sctp_packet_init(struct sctp_packet *, struct sctp_transport *,
 		      __u16 sport, __u16 dport);
-void sctp_packet_config(struct sctp_packet *, __u32 vtag, int);
+void sctp_packet_config(struct sctp_packet *packet, __u32 vtag,
+			int ecn_capable, int is_init);
 enum sctp_xmit sctp_packet_transmit_chunk(struct sctp_packet *packet,
 					  struct sctp_chunk *chunk,
 					  int one_packet, gfp_t gfp);
@@ -1146,6 +1149,7 @@ struct sctp_input_cb {
 struct sctp_output_cb {
 	struct sk_buff *last;
 	void *crypto_ctx;
+	struct sctp_transport *tp;
 };
 #define SCTP_OUTPUT_CB(__skb)	((struct sctp_output_cb *)&((__skb)->cb[0]))
 

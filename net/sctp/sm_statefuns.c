@@ -6450,7 +6450,7 @@ static struct sctp_packet *sctp_ootb_pkt_new(
 
 	packet = &transport->packet;
 	sctp_packet_init(packet, transport, sport, dport);
-	sctp_packet_config(packet, vtag, 0);
+	sctp_packet_config(packet, vtag, 0, 0);
 
 	return packet;
 

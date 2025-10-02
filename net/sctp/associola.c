@@ -1405,6 +1405,9 @@ void sctp_assoc_update_frag_point(struct sctp_association *asoc)
 	int frag = sctp_mtu_payload(sctp_sk(asoc->base.sk), asoc->pathmtu,
 				    sctp_datachk_len(&asoc->stream));
 
+	if (asoc->dtls.send_crypto[SCTP_CRYPTO_DATA])
+		frag -= SCTP_DTLS_OVERHEAD;
+
 	if (asoc->user_frag)
 		frag = min_t(int, frag, asoc->user_frag);
 
