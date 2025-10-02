@@ -2271,6 +2271,11 @@ enum sctp_disposition sctp_sf_do_5_2_4_dupcook(
 	/* Set temp so that it won't be added into hashtable */
 	new_asoc->temp = 1;
 
+	if (chunk->restart) /* Get the DTLS crypto for Protected Restart. */
+		sctp_dtls_copy_crypto(&new_asoc->dtls,
+				      (struct sctp_dtls *)&asoc->dtls,
+				      SCTP_CRYPTO_RESTART);
+
 	/* Compare the tie_tag in cookie with the verification tag of
 	 * current association.
 	 */

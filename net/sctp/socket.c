@@ -2152,6 +2152,8 @@ static int sctp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		msg->msg_flags |= MSG_NOTIFICATION;
 		sp->pf->event_msgname(event, msg->msg_name, &msg->msg_namelen);
 	} else {
+		if (event->msg_flags & MSG_PROTECTED)
+			msg->msg_flags |= MSG_PROTECTED;
 		sp->pf->skb_msgname(head_skb, msg->msg_name, &msg->msg_namelen);
 	}
 

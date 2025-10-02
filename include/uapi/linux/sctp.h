@@ -179,6 +179,8 @@ typedef __s32 sctp_assoc_t;
 enum sctp_msg_flags {
 	MSG_NOTIFICATION = 0x8000,
 #define MSG_NOTIFICATION MSG_NOTIFICATION
+	MSG_PROTECTED = 0x4000,
+#define MSG_PROTECTED MSG_PROTECTED
 };
 
 /* 5.3.1 SCTP Initiation Structure (SCTP_INIT)

@@ -66,26 +66,106 @@ void sctp_inq_free(struct sctp_inq *queue)
 	}
 }
 
+static void sctp_inq_push_dtls_cb(void *data, int err);
+
 /* Put a new packet in an SCTP inqueue.
  * We assume that packet->sctp_hdr is set and in host byte order.
  */
-void sctp_inq_push(struct sctp_inq *q, struct sctp_chunk *chunk)
+static void __sctp_inq_push(struct sctp_inq *q, struct sctp_chunk *chunk,
+			    u8 resume)
 {
+	struct sctp_chunkhdr *ch = (struct sctp_chunkhdr *)chunk->skb->data;
+	struct sctp_association *asoc = chunk->asoc;
+	int err;
+
 	/* Directly call the packet handling routine. */
-	if (chunk->rcvr->dead) {
-		sctp_chunk_free(chunk);
-		return;
+	if (chunk->skb->len < sizeof(*ch) || chunk->rcvr->dead)
+		goto free;
+
+	if (!asoc) {
+		if (ch->type == SCTP_CID_DTLS)
+			goto free;
+		goto out;
 	}
 
+	if (ch->type == SCTP_CID_DTLS) {
+		err = sctp_dtls_decode_record(&asoc->dtls, chunk->skb,
+					      sctp_inq_push_dtls_cb,
+					      GFP_ATOMIC, resume);
+		if (err == -EINPROGRESS) {
+			sctp_transport_hold(chunk->transport);
+			return;
+		}
+		if (err)
+			goto free;
+		chunk->has_dtls = 1;
+		chunk->restart = sctp_test_R_bit(ch);
+		if (chunk->restart &&
+		    !sctp_kmp_has_restart(&asoc->dtls.chosen_kmp))
+			goto free;
+	} else if (asoc->dtls.force_crypto && ch->type != SCTP_CID_INIT &&
+		   ch->type != SCTP_CID_SHUTDOWN_COMPLETE) {
+		/* DTLS Chunk Section 7.2.
+		 *
+		 * During the termination procedure all Control Chunks SHALL be
+		 * protected except SHUTDOWN-COMPLETE.
+		 */
+		asoc->dtls.stats.dropped_unprotected++;
+		goto free;
+	}
+	asoc->stats.ipackets++;
+
+out:
 	/* We are now calling this either from the soft interrupt
 	 * or from the backlog processing.
 	 * Eventually, we should clean up inqueue to not rely
 	 * on the BH related data structures.
 	 */
 	list_add_tail(&chunk->list, &q->in_chunk_list);
-	if (chunk->asoc)
-		chunk->asoc->stats.ipackets++;
 	q->immediate.func(&q->immediate);
+	return;
+free:
+	sctp_chunk_free(chunk);
+}
+
+void sctp_inq_push(struct sctp_inq *q, struct sctp_chunk *chunk)
+{
+	__sctp_inq_push(q, chunk, 0);
+}
+
+static void sctp_inq_push_dtls_cb(void *data, int err)
+{
+	struct sk_buff *skb = data;
+	struct sctp_transport *tp;
+	struct sctp_chunk *chunk;
+	struct sctp_inq *q;
+	struct sock *sk;
+
+	if (err == -EINPROGRESS)
+		return;
+
+	kfree_sensitive(SCTP_INPUT_CB(skb)->crypto_ctx);
+
+	chunk = SCTP_INPUT_CB(skb)->chunk;
+	tp = chunk->transport;
+	sk = chunk->rcvr->sk;
+	if (err) {
+		chunk->asoc->dtls.stats.aead_failures++;
+		sctp_chunk_free(chunk);
+		goto out;
+	}
+
+	q = &chunk->rcvr->inqueue;
+
+	lock_sock(sk);
+	__sctp_inq_push(q, chunk, 1);
+	release_sock(sk);
+
+out:
+	if (tp)
+		sctp_transport_put(tp);
+	else
+		sctp_endpoint_put(sctp_sk(sk)->ep);
 }
 
 /* Peek at the next chunk on the inqeue. */

@@ -749,6 +749,8 @@ struct sctp_ulpevent *sctp_ulpevent_make_rcvmsg(struct sctp_association *asoc,
 		event->flags |= SCTP_UNORDERED;
 		event->cumtsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
 	}
+	if (chunk->has_dtls)
+		event->msg_flags |= MSG_PROTECTED;
 	event->tsn = ntohl(chunk->subh.data_hdr->tsn);
 	event->msg_flags |= chunk->chunk_hdr->flags;
 

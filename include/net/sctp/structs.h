@@ -638,6 +638,8 @@ struct sctp_chunk {
 	__u16	rtt_in_progress:1,	/* This chunk used for RTT calc? */
 		has_tsn:1,		/* Does this chunk have a TSN yet? */
 		has_ssn:1,		/* Does this chunk have a SSN yet? */
+		has_dtls:1,		/* Encapsulated in a DTLS record */
+		restart:1,		/* Marks a DTLS-protected restart */
 #define has_mid has_ssn
 		singleton:1,		/* Only chunk in the packet? */
 		end_of_packet:1,	/* Last chunk in the packet? */
