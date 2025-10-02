@@ -82,6 +82,7 @@ TEST_PROGS := \
 	run_afpackettests \
 	run_netsocktests \
 	rxtimestamp.sh \
+	sctp_dtls.sh \
 	sctp_vrf.sh \
 	skf_net_off.sh \
 	srv6_end_dt46_l3vpn_test.sh \
@@ -154,6 +155,7 @@ TEST_GEN_FILES := \
 	reuseaddr_ports_exhausted \
 	reuseport_addr_any \
 	rxtimestamp \
+	sctp_dtls \
 	sctp_hello \
 	skf_net_off \
 	so_netns_cookie \
