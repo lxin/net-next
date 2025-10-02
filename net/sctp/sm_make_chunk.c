@@ -206,14 +206,15 @@ struct sctp_chunk *sctp_make_init(const struct sctp_association *asoc,
 	struct sctp_supported_addrs_param sat;
 	struct sctp_endpoint *ep = asoc->ep;
 	struct sctp_chunk *retval = NULL;
+	struct sctp_km_param km_param;
 	int num_types, addrs_len = 0;
+	int num_ext = 0, kmp_len;
 	struct sctp_inithdr init;
 	union sctp_params addrs;
 	struct sctp_sock *sp;
 	__u8 extensions[5];
 	size_t chunksize;
 	__be16 types[2];
-	int num_ext = 0;
 
 	/* RFC 2960 3.3.2 Initiation (INIT) (1)
 	 *
@@ -242,6 +243,10 @@ struct sctp_chunk *sctp_make_init(const struct sctp_association *asoc,
 
 	if (asoc->ep->prsctp_enable)
 		chunksize += sizeof(prsctp_param);
+
+	kmp_len = asoc->dtls.local_kmp.len;
+	if (asoc->dtls.local_kmp.data)
+		chunksize += sizeof(km_param) + kmp_len;
 
 	/* ADDIP: Section 4.2.7:
 	 *  An implementation supporting this extension [ADDIP] MUST list
@@ -345,6 +350,13 @@ struct sctp_chunk *sctp_make_init(const struct sctp_association *asoc,
 	if (asoc->ep->prsctp_enable)
 		sctp_addto_chunk(retval, sizeof(prsctp_param), &prsctp_param);
 
+	if (asoc->dtls.local_kmp.data) {
+		km_param.param_hdr.type = SCTP_PARAM_DTLS_CHUNK;
+		km_param.param_hdr.length = htons(sizeof(km_param) + kmp_len);
+		sctp_addto_chunk(retval, sizeof(km_param), &km_param);
+		sctp_addto_param(retval, kmp_len, asoc->dtls.local_kmp.data);
+	}
+
 	if (sp->adaptation_ind) {
 		aiparam.param_hdr.type = SCTP_PARAM_ADAPTATION_LAYER_IND;
 		aiparam.param_hdr.length = htons(sizeof(aiparam));
@@ -379,12 +391,13 @@ struct sctp_chunk *sctp_make_init_ack(const struct sctp_association *asoc,
 	struct sctp_paramhdr *auth_hmacs = NULL;
 	struct sctp_chunk *retval = NULL;
 	struct sctp_cookie_param *cookie;
+	struct sctp_km_param km_param;
 	struct sctp_inithdr initack;
+	int num_ext = 0, kmp_len;
 	union sctp_params addrs;
 	struct sctp_sock *sp;
 	__u8 extensions[5];
 	size_t chunksize;
-	int num_ext = 0;
 	int cookie_len;
 	int addrs_len;
 
@@ -417,6 +430,10 @@ struct sctp_chunk *sctp_make_init_ack(const struct sctp_association *asoc,
 
 	if (asoc->peer.prsctp_capable)
 		chunksize += sizeof(prsctp_param);
+
+	kmp_len = asoc->dtls.local_kmp.len;
+	if (asoc->dtls.local_kmp.data)
+		chunksize += sizeof(km_param) + kmp_len;
 
 	if (asoc->peer.asconf_capable) {
 		extensions[num_ext] = SCTP_CID_ASCONF;
@@ -493,6 +510,13 @@ struct sctp_chunk *sctp_make_init_ack(const struct sctp_association *asoc,
 	}
 	if (asoc->peer.prsctp_capable)
 		sctp_addto_chunk(retval, sizeof(prsctp_param), &prsctp_param);
+
+	if (asoc->dtls.local_kmp.data) {
+		km_param.param_hdr.type = SCTP_PARAM_DTLS_CHUNK;
+		km_param.param_hdr.length = htons(sizeof(km_param) + kmp_len);
+		sctp_addto_chunk(retval, sizeof(km_param), &km_param);
+		sctp_addto_param(retval, kmp_len, asoc->dtls.local_kmp.data);
+	}
 
 	if (sp->adaptation_ind) {
 		aiparam.param_hdr.type = SCTP_PARAM_ADAPTATION_LAYER_IND;
@@ -1978,6 +2002,20 @@ static int sctp_process_hn_param(const struct sctp_association *asoc,
 	return 0;
 }
 
+static int sctp_process_inv_dtls_chunk(const struct sctp_association *asoc,
+				       __be16 code, struct sctp_chunk *chunk,
+				       struct sctp_chunk **errp)
+{
+	if (!*errp)
+		*errp = sctp_make_op_error_space(asoc, chunk, 0);
+
+	if (*errp)
+		sctp_init_cause(*errp, code, 0);
+
+	/* Stop processing this chunk. */
+	return 0;
+}
+
 static int sctp_verify_ext_param(struct net *net,
 				 const struct sctp_endpoint *ep,
 				 union sctp_params param)
@@ -2139,7 +2177,10 @@ static enum sctp_ierror sctp_verify_param(struct net *net,
 {
 	struct sctp_hmac_algo_param *hmacs;
 	int retval = SCTP_IERROR_NO_ERROR;
+	__u8 flags = 0, pmid = 0;
+	struct sctp_kmp kmp;
 	__u16 n_elt, id = 0;
+	__be16 code = 0;
 	int i;
 
 	/* FIXME - This routine is not looking at each parameter per the
@@ -2245,6 +2286,27 @@ static enum sctp_ierror sctp_verify_param(struct net *net,
 			retval = SCTP_IERROR_ABORT;
 		}
 		break;
+	case SCTP_PARAM_DTLS_CHUNK:
+		kmp.data = (u8 *)(param.km + 1);
+		kmp.len = ntohs(param.p->length) - sizeof(*param.p);
+		if (kmp.len < SCTP_DTLS_PMID_OFF) {
+			sctp_process_inv_paramlength(asoc, param.p, chunk,
+						     err_chunk);
+			retval = SCTP_IERROR_ABORT;
+			break;
+		}
+		if (!ep->dtls.local_kmp.data)
+			break;
+		if (!sctp_kmp_get_match((struct sctp_kmp *)&ep->dtls.local_kmp,
+					&kmp, &flags, &pmid, &code)) {
+			if (!ep->dtls.strict)
+				break;
+			if (cid == SCTP_CID_INIT)
+				sctp_process_inv_dtls_chunk(asoc, code, chunk,
+							    err_chunk);
+			retval = SCTP_IERROR_ABORT;
+		}
+		break;
 unhandled:
 	default:
 		pr_debug("%s: unrecognized param:%d for chunk:%d\n",
@@ -2262,8 +2324,8 @@ int sctp_verify_init(struct net *net, const struct sctp_endpoint *ep,
 		     struct sctp_init_chunk *peer_init,
 		     struct sctp_chunk *chunk, struct sctp_chunk **errp)
 {
+	bool has_cookie = false, has_dtls = false;
 	union sctp_params param;
-	bool has_cookie = false;
 	int result;
 
 	/* Check for missing mandatory parameters. Note: Initial TSN is
@@ -2313,8 +2375,17 @@ int sctp_verify_init(struct net *net, const struct sctp_endpoint *ep,
 			break;
 		}
 
+		if (param.p->type == SCTP_PARAM_DTLS_CHUNK)
+			has_dtls = true;
 	} /* for (loop through all parameters) */
 
+	if (ep->dtls.strict && !has_dtls) {
+		if (cid != SCTP_CID_INIT)
+			return 0;
+		return sctp_process_inv_dtls_chunk(asoc,
+						   SCTP_ERROR_DTLS_SUPPORT,
+						   chunk, errp);
+	}
 	return 1;
 }
 
@@ -2518,6 +2589,7 @@ static int sctp_process_param(struct sctp_association *asoc,
 	struct sctp_transport *t;
 	enum sctp_scope scope;
 	union sctp_addr addr;
+	struct sctp_kmp kmp;
 	struct sctp_af *af;
 	int retval = 1, i;
 	u32 stale;
@@ -2702,6 +2774,22 @@ do_addr_param:
 					    ntohs(param.p->length), gfp);
 		if (!asoc->peer.peer_chunks)
 			retval = 0;
+		break;
+
+	case SCTP_PARAM_DTLS_CHUNK:
+		if (!asoc->dtls.local_kmp.data)
+			goto fall_through;
+		kmp.data = (u8 *)(param.km + 1);
+		kmp.len = ntohs(param.p->length) - sizeof(*param.p);
+		if (sctp_kmp_dup(&asoc->dtls.peer_kmp, &kmp, gfp)) {
+			retval = 0;
+			break;
+		}
+		if (sctp_kmp_copy_match(&asoc->dtls.chosen_kmp,
+					&asoc->dtls.local_kmp, &kmp, gfp)) {
+			retval = 0;
+			break;
+		}
 		break;
 fall_through:
 	default:

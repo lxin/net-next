@@ -363,6 +363,7 @@ union sctp_params {
 	struct sctp_chunks_param *chunks;
 	struct sctp_hmac_algo_param *hmac_algo;
 	struct sctp_addip_param *addip;
+	struct sctp_km_param *km;
 };
 
 /* RFC 2960.  Section 3.3.5 Heartbeat.

@@ -213,6 +213,9 @@ enum sctp_param {
 	SCTP_PARAM_CHUNKS			= cpu_to_be16(0x8003),
 	SCTP_PARAM_HMAC_ALGO			= cpu_to_be16(0x8004),
 
+	/* DTLS Chunk Section 4.1 */
+	SCTP_PARAM_DTLS_CHUNK		= cpu_to_be16(0x8006),
+
 	/* Add-IP: Supported Extensions, Section 4.2 */
 	SCTP_PARAM_SUPPORTED_EXT	= cpu_to_be16(0x8008),
 
@@ -842,6 +845,11 @@ struct sctp_strreset_resptsn {
 	__be32 result;
 	__be32 senders_next_tsn;
 	__be32 receivers_next_tsn;
+};
+
+struct sctp_km_param {
+	struct sctp_paramhdr param_hdr;
+	/* __u8 params[]; */
 };
 
 enum {
