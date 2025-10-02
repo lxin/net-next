@@ -76,6 +76,7 @@ struct sctp_stream;
 #include <net/sctp/ulpevent.h>
 #include <net/sctp/ulpqueue.h>
 #include <net/sctp/stream_interleave.h>
+#include <net/sctp/dtls.h>
 
 /* Structures useful for managing bind/connect. */
 
@@ -1132,7 +1133,8 @@ struct sctp_input_cb {
 #if IS_ENABLED(CONFIG_IPV6)
 		struct inet6_skb_parm   h6;
 #endif
-	} header;
+		void *crypto_ctx;
+	};
 	struct sctp_chunk *chunk;
 	struct sctp_af *af;
 	__be16 encap_port;
@@ -1141,6 +1143,7 @@ struct sctp_input_cb {
 
 struct sctp_output_cb {
 	struct sk_buff *last;
+	void *crypto_ctx;
 };
 #define SCTP_OUTPUT_CB(__skb)	((struct sctp_output_cb *)&((__skb)->cb[0]))
 
@@ -1323,6 +1326,9 @@ struct sctp_endpoint {
 	      reconf_enable:1;
 
 	__u8  strreset_enable;
+
+	struct sctp_dtls dtls;
+
 	struct rcu_head rcu;
 };
 
@@ -2082,6 +2088,8 @@ struct sctp_association {
 
 	u32 secid;
 	u32 peer_secid;
+
+	struct sctp_dtls dtls;
 
 	struct rcu_head rcu;
 };

@@ -9543,6 +9543,10 @@ static int sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
 	if (err)
 		return err;
 
+	if (sctp_kmp_dup(&newsp->ep->dtls.local_kmp, &oldsp->ep->dtls.local_kmp,
+			 GFP_KERNEL))
+		return -ENOMEM;
+
 	sctp_auto_asconf_init(newsp);
 
 	/* Move any messages in the old socket's receive queue that are for the

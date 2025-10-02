@@ -14,7 +14,7 @@ sctp-y := sm_statetable.o sm_statefuns.o sm_sideeffect.o \
 	  output.o input.o debug.o stream.o auth.o \
 	  offload.o stream_sched.o stream_sched_prio.o \
 	  stream_sched_rr.o stream_sched_fc.o \
-	  stream_interleave.o
+	  stream_interleave.o dtls.o
 
 sctp_diag-y := diag.o
 

@@ -215,6 +215,8 @@ static void sctp_endpoint_destroy(struct sctp_endpoint *ep)
 	sctp_auth_destroy_keys(&ep->endpoint_shared_keys);
 	sctp_auth_free(ep);
 
+	sctp_dtls_destroy(&ep->dtls);
+
 	/* Cleanup. */
 	sctp_inq_free(&ep->base.inqueue);
 	sctp_bind_addr_free(&ep->base.bind_addr);

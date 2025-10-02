@@ -251,10 +251,23 @@ static struct sctp_association *sctp_association_init(
 	asoc->default_timetolive = sp->default_timetolive;
 	asoc->default_rcv_context = sp->default_rcv_context;
 
+	if (sctp_kmp_dup(&asoc->dtls.local_kmp, &ep->dtls.local_kmp, gfp))
+		goto stream_free;
+
 	/* AUTH related initializations */
 	INIT_LIST_HEAD(&asoc->endpoint_shared_keys);
-	if (sctp_auth_asoc_copy_shkeys(ep, asoc, gfp))
+	if (sctp_auth_asoc_copy_shkeys(ep, asoc, gfp)) {
+		sctp_kmp_free(&asoc->dtls.local_kmp);
 		goto stream_free;
+	}
+
+	/* Get the DTLS crypto context for a protected SCTP restart if
+	 * available.
+	 */
+	sctp_dtls_copy_crypto(&asoc->dtls, (struct sctp_dtls *)&ep->dtls,
+			      SCTP_CRYPTO_RESTART);
+	asoc->dtls.replay_window = ep->dtls.replay_window;
+	asoc->dtls.strict = ep->dtls.strict;
 
 	asoc->active_key_id = ep->active_key_id;
 	asoc->strreset_enable = ep->strreset_enable;
@@ -392,6 +405,8 @@ void sctp_association_free(struct sctp_association *asoc)
 
 	/* AUTH - Free the association shared key */
 	sctp_auth_key_put(asoc->asoc_shared_key);
+
+	sctp_dtls_destroy(&asoc->dtls);
 
 	sctp_association_put(asoc);
 }
@@ -1156,6 +1171,14 @@ int sctp_assoc_update(struct sctp_association *asoc,
 		if (sctp_assoc_set_id(asoc, GFP_ATOMIC))
 			return -ENOMEM;
 	}
+
+	/* Clear the old DTLS crypto context by copying new assoc's crypto. */
+	if (sctp_dtls_copy_kmps(&asoc->dtls, &new->dtls))
+		return -ENOMEM;
+	sctp_dtls_copy_crypto(&asoc->dtls, &new->dtls, SCTP_CRYPTO_DATA);
+	asoc->dtls.replay_window = new->dtls.replay_window;
+	asoc->dtls.force_crypto = new->dtls.force_crypto;
+	asoc->dtls.strict = new->dtls.strict;
 
 	/* SCTP-AUTH: Save the peer parameters from the new associations
 	 * and also move the association shared keys over

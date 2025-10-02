@@ -11,6 +11,11 @@ menuconfig IP_SCTP
 	select CRYPTO_LIB_UTILS
 	select NET_CRC32C
 	select NET_UDP_TUNNEL
+	select CRYPTO
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_CCM
+	select CRYPTO_CHACHA20POLY1305
 	help
 	  Stream Control Transmission Protocol
 

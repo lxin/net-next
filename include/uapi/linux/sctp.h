@@ -1223,4 +1223,34 @@ struct sctp_probeinterval {
 	__u32 spi_interval;
 };
 
+#define SCTP_MAX_KEY_SIZE	32
+#define SCTP_IV_SIZE		12
+
+/* Send/Recv Keys Add socket option */
+struct sctp_dtls_keys {
+	sctp_assoc_t sdk_assoc_id;
+	__u8 sdk_cipher_suite[2];
+	__u16 sdk_restart;
+	__u64 sdk_epoch;
+	__u16 sdk_key_len;
+	__u16 sdk_iv_len;
+	__u16 sdk_sn_key_len;
+	__u16 sdk_unused;
+	__u8 sdk_keys[];
+};
+
+/* Send/Recv Keys Del socket option */
+struct sctp_dtls_keys_id {
+	sctp_assoc_t sdki_assoc_id;
+	__u32 sdki_restart;
+	__u64 sdki_epoch;
+};
+
+enum {
+	SCTP_DTLS_CLIENT	= 1 << 0,
+	SCTP_DTLS_SERVER	= 1 << 1,
+	SCTP_DTLS_RESTART	= 1 << 2,
+	SCTP_DTLS_REQUIRED	= 1 << 8,
+};
+
 #endif /* _UAPI_SCTP_H */

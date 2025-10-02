@@ -90,6 +90,9 @@ enum sctp_cid {
 	/* sctp ndata 5.1. I-DATA */
 	SCTP_CID_I_DATA			= 0x40,
 
+	/* DTLS Chunk Section 5.1 */
+	SCTP_CID_DTLS			= 0x41,
+
 	/* PR-SCTP Sec 3.2 */
 	SCTP_CID_FWD_TSN		= 0xC0,
 
@@ -147,6 +150,40 @@ enum { SCTP_CHUNK_FLAG_T = 0x01 };
  */
 
 #define sctp_test_T_bit(c)    ((c)->chunk_hdr->flags & SCTP_CHUNK_FLAG_T)
+
+/* This flag is used in Chunk Flags for DTLS Chunk:
+ *
+ * 3.9.1. Protected SCTP Restart:
+ *  A DTLS Chunk using the restart DTLS key context is identified by having the
+ *  R bit (Restart Indicator) set in the DTLS Chunk.
+ */
+enum {
+	SCTP_CHUNK_FLAG_R = 0x01,
+};
+
+/*
+ * Set the R bit
+ *
+ *   0                   1                   2                   3
+ *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *  | Type = 0x41   | reserved    |R|         Chunk Length          |
+ *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *  | Pre-Padding   |                                               |
+ *  +-+-+-+-+-+-+-+-+                                               |
+ *  |                                                               |
+ *  |                            Payload                            |
+ *  |                                                               |
+ *  |                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *  |                               |       Post-Padding            |
+ *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *
+ *  R: 1 bit (boolean)
+ *  Restart indicator.  If this bit is set this DTLS chunk is
+ *  protected with a restart DTLS key context.
+ */
+
+#define sctp_test_R_bit(c)		(!!((c)->flags & SCTP_CHUNK_FLAG_R))
 
 /* RFC 2960
  * Section 3.2.1 Optional/Variable-length Parmaeter Format.
@@ -494,6 +531,20 @@ enum sctp_error {
 	SCTP_ERROR_USER_ABORT      = cpu_to_be16(0x0c),
 	SCTP_ERROR_PROTO_VIOLATION = cpu_to_be16(0x0d),
 	SCTP_ERROR_NEW_ENCAP_PORT  = cpu_to_be16(0x0e),
+
+	/* DTLS Chunk Section 4.3. New Error Causes:
+	 *
+	 * Value          Cause Code
+	 * ---------      ----------------
+	 * 100              Missing DTLS Chunk Support
+	 * 101              No Common DTLS Key Management Method
+	 * 102              DTLS Key Management Tie Breaker Collision
+	 * 103              Incompatible DTLS Key Management Role
+	 */
+	SCTP_ERROR_DTLS_SUPPORT     = cpu_to_be16(0x64),
+	SCTP_ERROR_DTLS_METHOD      = cpu_to_be16(0x65),
+	SCTP_ERROR_DTLS_TIE_BREAKER = cpu_to_be16(0x66),
+	SCTP_ERROR_DTLS_ROLE        = cpu_to_be16(0x67),
 
 	/* ADDIP Section 3.3  New Error Causes
 	 *
