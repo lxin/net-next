@@ -100,6 +100,7 @@ Contents:
    proc_net_tcp
    pse-pd/index
    psp
+   quic
    radiotap-headers
    rds
    regulatory
