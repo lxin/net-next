@@ -72,6 +72,7 @@ TEST_PROGS := \
 	pmtu.sh \
 	protodown.sh \
 	psock_snd.sh \
+	quic_test.sh \
 	reuseaddr_ports_exhausted.sh \
 	reuseport_addr_any.sh \
 	route_hint.sh \
@@ -153,6 +154,7 @@ TEST_GEN_FILES := \
 	psock_fanout \
 	psock_snd \
 	psock_tpacket \
+	quic_test \
 	reuseaddr_ports_exhausted \
 	reuseport_addr_any \
 	rxtimestamp \
