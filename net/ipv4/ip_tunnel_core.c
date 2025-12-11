@@ -54,7 +54,9 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 {
 	int pkt_len = skb->len - skb_inner_network_offset(skb);
 	struct net *net = dev_net(rt->dst.dev);
+	struct ip_options_rcu *inet_opt = NULL;
 	struct net_device *dev = skb->dev;
+	int hlen = sizeof(struct iphdr);
 	struct iphdr *iph;
 	int err;
 
@@ -65,14 +67,26 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 	memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
 	IPCB(skb)->flags = ipcb_flags;
 
+	rcu_read_lock();
+	if (sk) {
+		inet_opt = rcu_dereference(inet_sk(sk)->inet_opt);
+		if (inet_opt)
+			hlen += inet_opt->opt.optlen;
+	}
+
+	if (unlikely(skb_cow_head(skb, hlen))) {
+		rcu_read_unlock();
+		kfree_skb(skb);
+		return;
+	}
 	/* Push down and install the IP header. */
-	skb_push(skb, sizeof(struct iphdr));
+	skb_push(skb, hlen);
 	skb_reset_network_header(skb);
 
 	iph = ip_hdr(skb);
 
 	iph->version	=	4;
-	iph->ihl	=	sizeof(struct iphdr) >> 2;
+	iph->ihl	=	hlen >> 2;
 	iph->frag_off	=	ip_mtu_locked(&rt->dst) ? 0 : df;
 	iph->protocol	=	proto;
 	iph->tos	=	tos;
@@ -80,6 +94,10 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 	iph->saddr	=	src;
 	iph->ttl	=	ttl;
 	__ip_select_ident(net, iph, skb_shinfo(skb)->gso_segs ?: 1);
+
+	if (inet_opt && inet_opt->opt.optlen)
+		ip_options_build(skb, &inet_opt->opt, dst, rt);
+	rcu_read_unlock();
 
 	err = ip_local_out(net, sk, skb);
 

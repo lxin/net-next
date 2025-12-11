@@ -83,8 +83,11 @@ void udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
 			  __be16 src_port, __be16 dst_port, bool nocheck,
 			  u16 ip6cb_flags)
 {
-	struct udphdr *uh;
+	struct ipv6_txoptions *opt = NULL;
+	u8 proto = IPPROTO_UDP;
 	struct ipv6hdr *ip6h;
+	struct udphdr *uh;
+	int exthlen = 0;
 
 	__skb_push(skb, sizeof(*uh));
 	skb_reset_transport_header(skb);
@@ -99,12 +102,31 @@ void udp_tunnel6_xmit_skb(struct dst_entry *dst, struct sock *sk,
 
 	udp6_set_csum(nocheck, skb, saddr, daddr, skb->len);
 
+	if (sk && inet6_sk(sk)) {
+		rcu_read_lock();
+		opt = rcu_dereference(inet6_sk(sk)->opt);
+		if (opt) {
+			exthlen = opt->opt_nflen + opt->opt_flen;
+			if (unlikely(skb_cow_head(skb, sizeof(*ip6h) + exthlen))) {
+				rcu_read_unlock();
+				kfree_skb(skb);
+				return;
+			}
+			if (opt->opt_flen)
+				ipv6_push_frag_opts(skb, opt, &proto);
+			if (opt->opt_nflen)
+				ipv6_push_nfrag_opts(skb, opt, &proto, (struct in6_addr **)&daddr,
+						     (struct in6_addr *)saddr);
+		}
+		rcu_read_unlock();
+	}
+
 	__skb_push(skb, sizeof(*ip6h));
 	skb_reset_network_header(skb);
 	ip6h		  = ipv6_hdr(skb);
 	ip6_flow_hdr(ip6h, prio, label);
-	ip6h->payload_len = htons(skb->len);
-	ip6h->nexthdr     = IPPROTO_UDP;
+	ip6h->payload_len = htons(skb->len + exthlen);
+	ip6h->nexthdr     = proto;
 	ip6h->hop_limit   = ttl;
 	ip6h->daddr	  = *daddr;
 	ip6h->saddr	  = *saddr;
