@@ -1605,6 +1605,255 @@ static void quic_close(struct sock *sk, long timeout)
 	sk_common_release(sk);
 }
 
+static int quic_sock_set_event(struct sock *sk, void *kopt, u32 len)
+{
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_event_option e = {};
+
+	quic_copy_common(&e, sizeof(e), kopt, len);
+
+	if (!e.type || e.type >= QUIC_EVENT_MAX)
+		return -EINVAL;
+
+	if (e.on) { /* Enable event by setting its bit. */
+		inq->events |= BIT(e.type);
+		return 0;
+	}
+	inq->events &= ~BIT(e.type); /* Disable by clearing its bit. */
+	return 0;
+}
+
+static int quic_sock_stream_reset(struct sock *sk, void *kopt, u32 len)
+{
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_errinfo info = {};
+	struct quic_stream *stream;
+	struct quic_frame *frame;
+	gfp_t gfp = GFP_KERNEL;
+
+	if (!quic_is_established(sk))
+		return -EINVAL;
+
+	quic_copy_common(&info, sizeof(info), kopt, len);
+
+	stream = quic_stream_get(streams, info.stream_id, 0, quic_is_serv(sk),
+				 true, gfp);
+	if (IS_ERR(stream))
+		return PTR_ERR(stream);
+
+	/* rfc9000#section-3.1:
+	 *
+	 * From any state that is one of "Ready", "Send", or "Data Sent", an
+	 * application can signal that it wishes to abandon transmission of
+	 * stream data.  The endpoint sends a RESET_STREAM frame, which causes
+	 * the stream to enter the "Reset Sent" state.
+	 */
+	if (stream->send.state >= QUIC_STREAM_SEND_STATE_RECVD)
+		return -EINVAL;
+
+	frame = quic_frame_create(sk, QUIC_FRAME_RESET_STREAM, &info, gfp);
+	if (IS_ERR(frame))
+		return PTR_ERR(frame);
+
+	stream->send.state = QUIC_STREAM_SEND_STATE_RESET_SENT;
+	quic_outq_ctrl_tail(sk, frame, false, gfp);
+	sk->sk_write_space(sk);
+	return 0;
+}
+
+static int quic_sock_stream_stop_sending(struct sock *sk, void *kopt, u32 len)
+{
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_errinfo info = {};
+	struct quic_stream *stream;
+	gfp_t gfp = GFP_KERNEL;
+
+	if (!quic_is_established(sk))
+		return -EINVAL;
+
+	quic_copy_common(&info, sizeof(info), kopt, len);
+
+	stream = quic_stream_get(streams, info.stream_id, 0, quic_is_serv(sk),
+				 false, gfp);
+	if (IS_ERR(stream))
+		return PTR_ERR(stream);
+
+	/* rfc9000#section-3.3:
+	 *
+	 * A receiver MAY send a STOP_SENDING frame in any state where it has
+	 * not received a RESET_STREAM frame -- that is, states other than
+	 * "Reset Recvd" or "Reset Read".  However, there is little value in
+	 * sending a STOP_SENDING frame in the "Data Recvd" state, as all
+	 * stream data has been received.
+	 */
+	if (stream->recv.state >= QUIC_STREAM_RECV_STATE_RECVD)
+		return -EINVAL;
+
+	/* Defer sending; a STOP_SENDING frame is already in flight. */
+	if (stream->recv.stop_sent)
+		return -EAGAIN;
+
+	return quic_outq_transmit_frame(sk, QUIC_FRAME_STOP_SENDING, &info, 0,
+					false, gfp);
+}
+
+static int quic_sock_set_connection_id(struct sock *sk, void *kopt, u32 len)
+{
+	struct quic_conn_id_set *id_set = quic_source(sk);
+	struct quic_connection_id_info info = {};
+	struct quic_conn_id *active;
+	u64 number, first, last;
+	gfp_t gfp = GFP_KERNEL;
+
+	if (!quic_is_established(sk))
+		return -EINVAL;
+
+	quic_copy_common(&info, sizeof(info), kopt, len);
+
+	if (info.dest) {
+		id_set = quic_dest(sk);
+		/* The alternative connection ID is reserved for the migration
+		 * path.  Until the migration completes and this path becomes
+		 * active, no modifications should be made to the destination
+		 * connection ID set until then.
+		 */
+		if (id_set->alt)
+			return -EAGAIN;
+	}
+
+	if (info.prior_to) {
+		/* Retire connection IDs up to (but not including) prior_to. */
+		number = info.prior_to;
+		last = quic_conn_id_last_number(id_set);
+		first = quic_conn_id_first_number(id_set);
+		if (number > last || number <= first ||
+		    number + id_set->max_count > U32_MAX)
+			return -EINVAL;
+	}
+
+	active = quic_conn_id_active(id_set);
+	if (info.active) { /* Change active connection ID. */
+		/* Ensure the new active ID is greater than the current one.
+		 * All lower-numbered IDs are implicitly treated as used.
+		 */
+		if (info.active <= quic_conn_id_number(active))
+			return -EINVAL;
+		active = quic_conn_id_find(id_set, info.active);
+		if (!active)
+			return -EINVAL;
+		quic_conn_id_set_active(id_set, active);
+	}
+
+	if (!info.prior_to)
+		return 0;
+
+	/* Retire source conn IDs via NEW_CONNECTION_ID frames. */
+	if (!info.dest)
+		return quic_outq_transmit_new_conn_id(sk, number, 0, false,
+						      gfp);
+
+	/* Retire destination conn IDs via RETIRE_CONNECTION_ID frames. */
+	return quic_outq_transmit_retire_conn_id(sk, number, 0, false, gfp);
+}
+
+static int quic_sock_set_connection_close(struct sock *sk, void *kopt, u32 len)
+{
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_connection_close c = {};
+	u8 *data = NULL;
+
+	quic_copy_common(&c, sizeof(c) - 1, kopt, len);
+
+	if (strlen(c.phrase)) {
+		data = kmemdup(c.phrase, strlen(c.phrase) + 1, GFP_KERNEL);
+		if (!data)
+			return -ENOMEM;
+	}
+
+	kfree(outq->close_phrase);
+	outq->close_phrase = data;
+	outq->close_errcode = c.errcode;
+	outq->close_frame = 0;
+	return 0;
+}
+
+static int quic_sock_connection_migrate(struct sock *sk, struct sockaddr *addr,
+					u32 addr_len)
+{
+	struct quic_path_group *paths = quic_paths(sk);
+	union quic_addr a;
+	int err;
+
+	if (quic_get_user_addr(sk, &a, addr, addr_len, false) || !a.v4.sin_port)
+		return -EINVAL;
+	/* Reject if connection is closed or address matches the current path's
+	 * source.
+	 */
+	if (quic_is_closed(sk) || quic_is_listen(sk))
+		return -EPIPE;
+	if (quic_cmp_sk_addr(sk, quic_path_saddr(paths, 0), &a))
+		return -EINVAL;
+
+	if (quic_is_establishing(sk)) {
+		/* Allows setting a preferred address before the handshake
+		 * completes. The address may use a different address family
+		 * (e.g., IPv4 vs IPv6).
+		 */
+		if (!quic_is_serv(sk) || paths->disable_saddr_alt)
+			return -EINVAL;
+		paths->pref_addr = 1;
+		quic_path_set_saddr(paths, 1, &a);
+		return 0;
+	}
+
+	/* Migration requires matching address family. */
+	if (a.sa.sa_family != quic_path_saddr(paths, 0)->sa.sa_family)
+		return -EINVAL;
+	/* Reject if migration in progress or preferred address active. */
+	if (!quic_path_alt_state(paths, QUIC_PATH_ALT_NONE) || paths->pref_addr)
+		return -EAGAIN;
+
+	/* Setup the source address on path 1 and bind to it. */
+	quic_path_set_saddr(paths, 1, &a);
+	err = quic_path_bind(sk, paths, 1);
+	if (err) {
+		memset(quic_path_saddr(paths, 1), 0, sizeof(a));
+		return err;
+	}
+	/* Set path 1 destination addr same as path 0 and configure routing. */
+	quic_path_set_daddr(paths, 1, quic_path_daddr(paths, 0));
+	if (quic_packet_config(sk, QUIC_CRYPTO_APP, 1)) {
+		err = -EINVAL;
+		goto err;
+	}
+	/* Start connection migration using new path. */
+	err = quic_outq_probe_path_alt(sk, false, GFP_KERNEL);
+	if (err)
+		goto err;
+	return 0;
+err:
+	quic_path_unbind(sk, paths, 1); /* Cleanup path 1 on failure. */
+	return err;
+}
+
+static int quic_sock_key_update(struct sock *sk, void *kopt, u32 optlen)
+{
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_APP);
+	int err;
+
+	if (!quic_is_established(sk))
+		return -EPIPE;
+
+	err = quic_crypto_key_update(crypto);
+	if (err)
+		return err;
+
+	crypto->key_pending = 1;
+	crypto->key_derived = 0;
+	crypto->key_phase = !crypto->key_phase;
+	return 0;
+}
+
 /**
  * quic_do_setsockopt - set a QUIC socket option
  * @sk: socket to configure
@@ -1621,7 +1870,47 @@ static void quic_close(struct sock *sk, long timeout)
 int quic_do_setsockopt(struct sock *sk, int optname, sockptr_t optval,
 		       unsigned int optlen)
 {
-	return -EOPNOTSUPP;
+	void *kopt = NULL;
+	int retval = 0;
+
+	if (optlen > 0) {
+		if (optlen > QUIC_TICKET_MAX_LEN)
+			return -EINVAL;
+		kopt = memdup_sockptr(optval, optlen);
+		if (IS_ERR(kopt))
+			return PTR_ERR(kopt);
+	}
+
+	lock_sock(sk);
+	switch (optname) {
+	case QUIC_SOCKOPT_EVENT:
+		retval = quic_sock_set_event(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_STREAM_RESET:
+		retval = quic_sock_stream_reset(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_STREAM_STOP_SENDING:
+		retval = quic_sock_stream_stop_sending(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CONNECTION_ID:
+		retval = quic_sock_set_connection_id(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CONNECTION_CLOSE:
+		retval = quic_sock_set_connection_close(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CONNECTION_MIGRATION:
+		retval = quic_sock_connection_migrate(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_KEY_UPDATE:
+		retval = quic_sock_key_update(sk, kopt, optlen);
+		break;
+	default:
+		retval = -ENOPROTOOPT;
+		break;
+	}
+	release_sock(sk);
+	kfree(kopt);
+	return retval;
 }
 EXPORT_SYMBOL_GPL(quic_do_setsockopt);
 
@@ -1633,6 +1922,122 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 					      optlen);
 
 	return quic_do_setsockopt(sk, optname, optval, optlen);
+}
+
+static int quic_sock_get_event(struct sock *sk, u32 len, sockptr_t optval,
+			       sockptr_t optlen)
+{
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_event_option e = {};
+
+	if (len > sizeof(e))
+		len = sizeof(e);
+
+	if (copy_from_sockptr(&e, optval, len))
+		return -EFAULT;
+
+	if (!e.type || e.type >= QUIC_EVENT_MAX)
+		return -EINVAL;
+	/* Set on if the corresponding event bit is set. */
+	e.on = !!(inq->events & BIT(e.type));
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) ||
+	    copy_to_sockptr(optval, &e, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_stream_open(struct sock *sk, u32 len, sockptr_t optval,
+				 sockptr_t optlen)
+{
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream_info sinfo = {};
+	struct quic_stream *stream;
+
+	if (quic_is_closed(sk) || quic_is_listen(sk))
+		return -EPIPE;
+
+	if (len > sizeof(sinfo))
+		len = sizeof(sinfo);
+
+	if (copy_from_sockptr(&sinfo, optval, len))
+		return -EFAULT;
+
+	/* Reject unsupported flags. */
+	if (sinfo.stream_flags & ~QUIC_MSG_STREAM_FLAGS)
+		return -EINVAL;
+
+	/* If stream_id is -1, assign the next available ID (bidi or uni). */
+	if (sinfo.stream_id == -1) {
+		sinfo.stream_id = streams->send.next_bidi_stream_id;
+		if (sinfo.stream_flags & MSG_QUIC_STREAM_UNI)
+			sinfo.stream_id = streams->send.next_uni_stream_id;
+	}
+	/* Mark stream as to be created. */
+	sinfo.stream_flags |= MSG_QUIC_STREAM_NEW;
+
+	/* Create or retrieve stream. */
+	stream = quic_sock_send_stream(sk, &sinfo);
+	if (IS_ERR(stream))
+		return PTR_ERR(stream);
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) ||
+	    copy_to_sockptr(optval, &sinfo, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_connection_id(struct sock *sk, u32 len,
+				       sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_connection_id_info info = {};
+	struct quic_conn_id_set *id_set;
+	struct quic_conn_id *active;
+
+	if (!quic_is_established(sk))
+		return -EINVAL;
+
+	if (len > sizeof(info))
+		len = sizeof(info);
+
+	if (copy_from_sockptr(&info, optval, len))
+		return -EFAULT;
+
+	id_set = info.dest ? quic_dest(sk) : quic_source(sk);
+	active = quic_conn_id_active(id_set);
+	info.active = quic_conn_id_number(active);
+	/* Use prior_to to indicate the smallest issued connection ID number.
+	 * Combined with the active_connection_id_limit (from the peer’s
+	 * transport parameters), this allows userspace to infer the full set
+	 * of valid connection IDs.
+	 */
+	info.prior_to = quic_conn_id_first_number(id_set);
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) ||
+	    copy_to_sockptr(optval, &info, len))
+		return -EFAULT;
+	return 0;
+}
+
+static int quic_sock_get_connection_close(struct sock *sk, u32 len,
+					  sockptr_t optval, sockptr_t optlen)
+{
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_connection_close c = {};
+
+	if (len > sizeof(c))
+		len = sizeof(c);
+
+	c.errcode = outq->close_errcode;
+	c.frame = outq->close_frame;
+
+	if (outq->close_phrase)
+		strscpy(c.phrase, outq->close_phrase, sizeof(c.phrase));
+
+	if (copy_to_sockptr(optlen, &len, sizeof(len)) ||
+	    copy_to_sockptr(optval, &c, len))
+		return -EFAULT;
+	return 0;
 }
 
 /**
@@ -1651,7 +2056,33 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 int quic_do_getsockopt(struct sock *sk, int optname, sockptr_t optval,
 		       sockptr_t optlen)
 {
-	return -EOPNOTSUPP;
+	int retval = 0;
+	u32 len;
+
+	if (copy_from_sockptr(&len, optlen, sizeof(len)))
+		return -EFAULT;
+
+	lock_sock(sk);
+	switch (optname) {
+	case QUIC_SOCKOPT_EVENT:
+		retval = quic_sock_get_event(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_STREAM_OPEN:
+		retval = quic_sock_stream_open(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_CONNECTION_ID:
+		retval = quic_sock_get_connection_id(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_CONNECTION_CLOSE:
+		retval = quic_sock_get_connection_close(sk, len, optval,
+							optlen);
+		break;
+	default:
+		retval = -ENOPROTOOPT;
+		break;
+	}
+	release_sock(sk);
+	return retval;
 }
 EXPORT_SYMBOL_GPL(quic_do_getsockopt);
 
