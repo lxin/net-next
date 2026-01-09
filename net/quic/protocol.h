@@ -49,6 +49,8 @@ struct quic_net {
 #if IS_ENABLED(CONFIG_PROC_FS)
 	struct proc_dir_entry *proc_net; /* procfs entry for QUIC stats */
 #endif
+	/* Context for decrypting Initial packets for ALPN */
+	struct quic_crypto crypto;
 };
 
 struct quic_net *quic_net(struct net *net);
