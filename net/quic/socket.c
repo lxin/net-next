@@ -11,6 +11,7 @@
  */
 
 #include <net/inet_common.h>
+#include <asm/ioctls.h>
 #include <net/tls.h>
 
 #include "socket.h"
@@ -336,6 +337,36 @@ static void quic_sock_fetch_transport_param(struct sock *sk,
 	quic_conn_id_get_param(id_set, p);
 	quic_path_get_param(quic_paths(sk), p);
 	quic_stream_get_param(quic_streams(sk), p);
+}
+
+static int quic_ioctl(struct sock *sk, int cmd, int *karg)
+{
+	int err = 0;
+
+	lock_sock(sk);
+
+	if (quic_is_listen(sk)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	switch (cmd) {
+	case SIOCINQ:
+		*karg = sk_rmem_alloc_get(sk);
+		break;
+	case SIOCOUTQ:
+		*karg = sk_wmem_alloc_get(sk);
+		break;
+	case SIOCOUTQNSD:
+		*karg = quic_outq(sk)->unsent_bytes;
+		break;
+	default:
+		err = -ENOIOCTLCMD;
+		break;
+	}
+out:
+	release_sock(sk);
+	return err;
 }
 
 static void quic_sock_destruct(struct sock *sk)
@@ -2798,6 +2829,7 @@ static int quic_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 struct proto quic_prot = {
 	.name		=  "QUIC",
 	.owner		=  THIS_MODULE,
+	.ioctl		=  quic_ioctl,
 	.init		=  quic_init_sock,
 	.destroy	=  quic_destroy_sock,
 	.shutdown	=  quic_shutdown,
@@ -2829,6 +2861,7 @@ struct proto quic_prot = {
 struct proto quicv6_prot = {
 	.name		=  "QUICv6",
 	.owner		=  THIS_MODULE,
+	.ioctl		=  quic_ioctl,
 	.init		=  quic_init_sock,
 	.destroy	=  quic_destroy_sock,
 	.shutdown	=  quic_shutdown,

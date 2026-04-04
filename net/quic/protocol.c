@@ -190,6 +190,193 @@ struct quic_net *quic_net(struct net *net)
 }
 
 #if IS_ENABLED(CONFIG_PROC_FS)
+struct quic_iter_state {
+	struct seq_net_private p;
+	u32 bucket;
+};
+
+static struct sock *quic_get_bucket_sock(struct seq_file *seq, bool listen)
+{
+	struct quic_iter_state *st = seq->private;
+	struct net *net = seq_file_net(seq);
+	struct hlist_nulls_node *node;
+	struct quic_shash_head *head;
+	struct sock *sk;
+	u32 size;
+
+	size = listen ? quic_listen_sock_hash_size() : quic_sock_hash_size();
+	for (; st->bucket < size; st->bucket++) {
+		head = listen ? quic_listen_sock_head(st->bucket) :
+				quic_sock_head(st->bucket);
+		sk_nulls_for_each_rcu(sk, node, &head->head) {
+			if (net != sock_net(sk))
+				continue;
+			if (likely(refcount_inc_not_zero(&sk->sk_refcnt)))
+				return sk;
+		}
+	}
+	return NULL;
+}
+
+static struct sock *quic_get_first_sock(struct seq_file *seq, bool listen)
+{
+	struct quic_iter_state *st = seq->private;
+	struct sock *sk;
+
+	st->bucket = 0;
+	rcu_read_lock();
+	sk = quic_get_bucket_sock(seq, listen);
+	rcu_read_unlock();
+	return sk;
+}
+
+static struct sock *quic_get_next_sock(struct seq_file *seq, struct sock *sk,
+				       bool listen)
+{
+	struct quic_iter_state *st = seq->private;
+	struct net *net = seq_file_net(seq);
+	struct sock *nsk = sk;
+
+	rcu_read_lock();
+	while ((nsk = sk_nulls_next(nsk)) != NULL) {
+		if (net != sock_net(nsk))
+			continue;
+		if (likely(refcount_inc_not_zero(&nsk->sk_refcnt)))
+			break;
+	}
+	if (!nsk) {
+		st->bucket++;
+		nsk = quic_get_bucket_sock(seq, listen);
+	}
+	rcu_read_unlock();
+	sock_put(sk);
+	return nsk;
+}
+
+static struct sock *quic_get_idx_sock(struct seq_file *seq, loff_t pos,
+				      bool listen)
+{
+	struct sock *sk = quic_get_first_sock(seq, listen);
+
+	while (sk && pos--)
+		sk = quic_get_next_sock(seq, sk, listen);
+	return sk;
+}
+
+static int quic_conns_seq_show(struct seq_file *seq, void *v)
+{
+	struct quic_path_group *paths;
+	struct quic_outqueue *outq;
+	struct sock *sk = v;
+	struct net *net;
+	uid_t uid;
+
+	if (v == SEQ_START_TOKEN) {
+		seq_printf(seq, "SOCK\tSTATE\tLOCAL_ADDRESS\tREMOTE_ADDRESS\t"
+				"UDP_ADDRESS\tWINDOW\tMSS\tIN_FLIGHT\t"
+				"TX_QUEUE\tRX_QUEUE\tSNDBUF\tRCVBUF\t"
+				"UID\tINODE\n");
+		return 0;
+	}
+
+	net = seq_file_net(seq);
+	seq_printf(seq, "%pK\t%d\t", sk, sk->sk_state);
+
+	paths = quic_paths(sk);
+	quic_seq_dump_addr(seq, quic_path_saddr(paths, 0));
+	quic_seq_dump_addr(seq, quic_path_daddr(paths, 0));
+	quic_seq_dump_addr(seq, quic_path_uaddr(paths, 0));
+
+	outq = quic_outq(sk);
+	seq_printf(seq, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t", outq->window,
+		   quic_packet_mss(quic_packet(sk)), outq->inflight,
+		   READ_ONCE(sk->sk_wmem_queued), sk_rmem_alloc_get(sk),
+		   sk->sk_sndbuf, sk->sk_rcvbuf);
+
+	uid = from_kuid_munged(seq_user_ns(seq), sock_net_uid(net, sk));
+	seq_printf(seq, "%u\t%llu\n", uid, sock_i_ino(sk));
+
+	return 0;
+}
+
+static void *quic_conns_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	if (!*pos)
+		return SEQ_START_TOKEN;
+
+	return quic_get_idx_sock(seq, *pos - 1, false);
+}
+
+static void *quic_conns_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	struct sock *sk;
+
+	++*pos;
+	if (v == SEQ_START_TOKEN)
+		sk = quic_get_first_sock(seq, false);
+	else
+		sk = quic_get_next_sock(seq, v, false);
+	return sk;
+}
+
+static void quic_conns_seq_stop(struct seq_file *seq, void *v)
+{
+	if (v && v != SEQ_START_TOKEN)
+		sock_put((struct sock *)v);
+}
+
+static int quic_eps_seq_show(struct seq_file *seq, void *v)
+{
+	struct quic_path_group *paths;
+	struct sock *sk = v;
+	struct net *net;
+	uid_t uid;
+
+	if (v == SEQ_START_TOKEN) {
+		seq_printf(seq, "SOCK\tSTATE\tLOCAL_ADDRESS\tUDP_ADDRESS\t"
+				"UID\tINODE\n");
+		return 0;
+	}
+
+	net = seq_file_net(seq);
+	seq_printf(seq, "%pK\t%d\t", sk, sk->sk_state);
+
+	paths = quic_paths(sk);
+	quic_seq_dump_addr(seq, quic_path_saddr(paths, 0));
+	quic_seq_dump_addr(seq, quic_path_uaddr(paths, 0));
+
+	uid = from_kuid_munged(seq_user_ns(seq), sock_net_uid(net, sk));
+	seq_printf(seq, "%u\t%llu\n", uid, sock_i_ino(sk));
+
+	return 0;
+}
+
+static void *quic_eps_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	if (!*pos)
+		return SEQ_START_TOKEN;
+
+	return quic_get_idx_sock(seq, *pos - 1, true);
+}
+
+static void *quic_eps_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	struct sock *sk;
+
+	++*pos;
+	if (v == SEQ_START_TOKEN)
+		sk = quic_get_first_sock(seq, true);
+	else
+		sk = quic_get_next_sock(seq, v, true);
+	return sk;
+}
+
+static void quic_eps_seq_stop(struct seq_file *seq, void *v)
+{
+	if (v && v != SEQ_START_TOKEN)
+		sock_put((struct sock *)v);
+}
+
 static const struct snmp_mib quic_snmp_list[] = {
 	SNMP_MIB_ITEM("QuicConnCurrentEstabs", QUIC_MIB_CONN_CURRENTESTABS),
 	SNMP_MIB_ITEM("QuicConnPassiveEstabs", QUIC_MIB_CONN_PASSIVEESTABS),
@@ -230,6 +417,20 @@ static int quic_snmp_seq_show(struct seq_file *seq, void *v)
 	return 0;
 }
 
+static const struct seq_operations quic_conns_seq_ops = {
+	.show		= quic_conns_seq_show,
+	.start		= quic_conns_seq_start,
+	.next		= quic_conns_seq_next,
+	.stop		= quic_conns_seq_stop,
+};
+
+static const struct seq_operations quic_eps_seq_ops = {
+	.show		= quic_eps_seq_show,
+	.start		= quic_eps_seq_start,
+	.next		= quic_eps_seq_next,
+	.stop		= quic_eps_seq_stop,
+};
+
 static int quic_net_proc_init(struct net *net)
 {
 	quic_net(net)->proc_net = proc_net_mkdir(net, "quic", net->proc_net);
@@ -238,6 +439,13 @@ static int quic_net_proc_init(struct net *net)
 
 	if (!proc_create_net_single("snmp", 0444, quic_net(net)->proc_net,
 				    quic_snmp_seq_show, NULL))
+		goto free;
+	if (!proc_create_net("conns", 0444, quic_net(net)->proc_net,
+			     &quic_conns_seq_ops,
+			     sizeof(struct quic_iter_state)))
+		goto free;
+	if (!proc_create_net("eps", 0444, quic_net(net)->proc_net,
+			     &quic_eps_seq_ops, sizeof(struct quic_iter_state)))
 		goto free;
 	return 0;
 free:

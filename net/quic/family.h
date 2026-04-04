@@ -15,6 +15,7 @@
 #define QUIC_PREF_ADDR_LEN \
 	(QUIC_ADDR4_LEN + QUIC_PORT_LEN + QUIC_ADDR6_LEN + QUIC_PORT_LEN)
 
+void quic_seq_dump_addr(struct seq_file *seq, union quic_addr *addr);
 bool quic_is_any_addr(union quic_addr *a);
 u32 quic_encap_len(union quic_addr *a);
 
