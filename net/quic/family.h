@@ -30,6 +30,9 @@ void quic_get_msg_addrs(struct sk_buff *skb, union quic_addr *da,
 int quic_get_mtu_info(struct sk_buff *skb, u32 *info);
 u8 quic_get_msg_ecn(struct sk_buff *skb);
 
+int quic_get_user_addr(struct sock *sk, union quic_addr *a,
+		       struct sockaddr *addr, int addr_len, bool any);
+
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 		      union quic_addr *addr);
 int quic_get_sk_addr(struct socket *sock, struct sockaddr *a, int peer);

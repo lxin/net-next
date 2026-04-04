@@ -44,7 +44,86 @@ static int quic_inet_connect(struct socket *sock, struct sockaddr_unsized *addr,
 
 static int quic_inet_listen(struct socket *sock, int backlog)
 {
-	return -EOPNOTSUPP;
+	struct quic_conn_id_set *source, *dest;
+	struct quic_conn_id conn_id = {};
+	struct quic_path_group *paths;
+	struct quic_crypto *crypto;
+	struct sock *sk = sock->sk;
+	gfp_t gfp = GFP_KERNEL;
+	union quic_addr *a;
+	int err = -EINVAL;
+
+	lock_sock(sk);
+
+	crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	source = quic_source(sk);
+	dest = quic_dest(sk);
+	paths = quic_paths(sk);
+
+	if (!backlog) {
+		if (quic_is_listen(sk)) {
+			/* Exit listen state if backlog is zero. */
+			err = 0;
+			goto free;
+		}
+		goto out;
+	}
+
+	if (!sk_unhashed(sk)) { /* Already hashed/listening. */
+		if (quic_is_listen(sk)) {
+			sk->sk_max_ack_backlog = backlog;
+			err = 0;
+		}
+		goto out;
+	}
+
+	a = quic_path_saddr(paths, 0);
+	if (!a->v4.sin_port) { /* Auto-bind if not already bound. */
+		if (!a->sa.sa_family)
+			a->sa.sa_family = sk->sk_family;
+		err = quic_path_bind(sk, paths, 0);
+		if (err)
+			goto free;
+		quic_set_sk_addr(sk, a, true);
+	}
+	/* Generate and add destination and source connection IDs for sending
+	 * Initial-level CLOSE frames to refuse connection attempts in case of
+	 * verification failure.
+	 */
+	quic_conn_id_generate(&conn_id);
+	err = quic_conn_id_add(dest, &conn_id, 0, NULL, gfp);
+	if (err)
+		goto free;
+	quic_conn_id_generate(&conn_id);
+	err = quic_conn_id_add(source, &conn_id, 0, sk, gfp);
+	if (err)
+		goto free;
+	/* Install initial keys to generate Retry/Stateless Reset tokens. */
+	err = quic_crypto_set_cipher(crypto, TLS_CIPHER_AES_GCM_128);
+	if (err)
+		goto free;
+	err = quic_crypto_set_token_secret(crypto);
+	if (err)
+		goto free;
+
+	/* Set socket state to LISTENING and add to sock hash table. */
+	quic_set_state(sk, QUIC_SS_LISTENING);
+	sk->sk_max_ack_backlog = backlog;
+	err = sk->sk_prot->hash(sk);
+	if (err)
+		goto free;
+out:
+	release_sock(sk);
+	return err;
+free:
+	sk->sk_prot->unhash(sk);
+	quic_set_state(sk, QUIC_SS_CLOSED);
+	sk->sk_max_ack_backlog = 0;
+
+	quic_conn_id_set_free(source);
+	quic_conn_id_set_free(dest);
+	quic_crypto_free(crypto);
+	goto out;
 }
 
 static int quic_inet_getname(struct socket *sock, struct sockaddr *uaddr,
@@ -56,7 +135,53 @@ static int quic_inet_getname(struct socket *sock, struct sockaddr *uaddr,
 static __poll_t quic_inet_poll(struct file *file, struct socket *sock,
 			       poll_table *wait)
 {
-	return 0;
+	struct sock *sk = sock->sk;
+	struct list_head *head;
+	__poll_t mask;
+
+	sock_poll_wait(file, sock, wait);
+
+	sock_rps_record_flow(sk); /* Record flow's CPU association for RFS. */
+
+	/* A listening socket becomes readable when the accept queue is not
+	 * empty.
+	 */
+	if (quic_is_listen(sk))
+		return !list_empty(quic_reqs(sk)) ? (EPOLLIN | EPOLLRDNORM) : 0;
+
+	mask = 0;
+	/* Error check. */
+	if (sk->sk_err || !skb_queue_empty_lockless(&sk->sk_error_queue))
+		mask |= EPOLLERR |
+			(sock_flag(sk, SOCK_SELECT_ERR_QUEUE) ? EPOLLPRI : 0);
+
+	head = &quic_inq(sk)->recv_list;
+	if (!list_empty(head)) /* Readable check. */
+		mask |= EPOLLIN | EPOLLRDNORM;
+
+	if (quic_is_closed(sk)) {
+		/* A broken connection should report almost everything in order
+		 * to let applications to detect it reliably.
+		 */
+		mask |= EPOLLHUP;
+		mask |= EPOLLERR;
+		mask |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
+		mask |= EPOLLOUT | EPOLLWRNORM;
+		return mask;
+	}
+
+	/* Writable check. */
+	if (sk_stream_wspace(sk) > 0 && quic_outq_wspace(sk, NULL) > 0) {
+		mask |= EPOLLOUT | EPOLLWRNORM;
+	} else {
+		sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
+		/* Do writeable check again after the bit is set to avoid a
+		 * lost I/O signal, similar to sctp_poll().
+		 */
+		if (sk_stream_wspace(sk) > 0 && quic_outq_wspace(sk, NULL) > 0)
+			mask |= EPOLLOUT | EPOLLWRNORM;
+	}
+	return mask;
 }
 
 struct quic_net *quic_net(struct net *net)

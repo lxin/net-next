@@ -261,6 +261,76 @@ static u8 quic_v6_get_msg_ecn(struct sk_buff *skb)
 	return (ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK);
 }
 
+static int quic_v4_get_user_addr(struct sock *sk, union quic_addr *a,
+				 struct sockaddr *addr, int addr_len, bool any)
+{
+	if (addr_len < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET)
+		return -EINVAL;
+	if (ipv4_is_multicast(quic_addr(addr)->v4.sin_addr.s_addr))
+		return -EINVAL;
+	if (quic_addr(addr)->v4.sin_addr.s_addr == htonl(INADDR_ANY) && !any)
+		return -EINVAL;
+	memcpy(a, addr, offsetof(struct sockaddr_in, __pad));
+	return 0;
+}
+
+static int quic_v6_get_user_addr(struct sock *sk, union quic_addr *a,
+				 struct sockaddr *addr, int addr_len, bool any)
+{
+	u32 len = sizeof(struct sockaddr_in);
+	union quic_addr *ua;
+	int type;
+
+	if (addr_len < len)
+		return -EINVAL;
+
+	if (addr->sa_family != AF_INET6) {
+		if (ipv6_only_sock(sk))
+			return -EINVAL;
+		return quic_v4_get_user_addr(sk, a, addr, addr_len, any);
+	}
+
+	len = sizeof(struct sockaddr_in6);
+	if (addr_len < len)
+		return -EINVAL;
+	ua = quic_addr(addr);
+	type = ipv6_addr_type(&ua->v6.sin6_addr);
+	if (type == IPV6_ADDR_MAPPED) {
+		if (ipv6_only_sock(sk))
+			return -EINVAL;
+		a->v4.sin_family = AF_INET;
+		a->v4.sin_port = ua->v6.sin6_port;
+		a->v4.sin_addr.s_addr = ua->v6.sin6_addr.s6_addr32[3];
+		return 0;
+	}
+	if (type != IPV6_ADDR_ANY && !(type & IPV6_ADDR_UNICAST))
+		return -EINVAL;
+	if (type == IPV6_ADDR_ANY && !any)
+		return -EINVAL;
+	if (type & IPV6_ADDR_LINKLOCAL) {
+		if (!ua->v6.sin6_scope_id)
+			return -EINVAL;
+
+		rcu_read_lock();
+		if (!dev_get_by_index_rcu(sock_net(sk), ua->v6.sin6_scope_id)) {
+			rcu_read_unlock();
+			return -EINVAL;
+		}
+		rcu_read_unlock();
+	}
+
+	memcpy(a, addr, len);
+
+	/* Clear sin6_flowinfo and sin6_scope_id so listen socket address
+	 * comparison can rely on memcmp() for hashing and lookup.
+	 */
+	if (any)
+		a->v6.sin6_flowinfo = 0;
+	if (!(type & IPV6_ADDR_LINKLOCAL))
+		a->v6.sin6_scope_id = 0;
+	return 0;
+}
+
 static bool quic_v4_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 				union quic_addr *addr)
 {
@@ -442,6 +512,15 @@ u8 quic_get_msg_ecn(struct sk_buff *skb)
 }
 
 #define quic_pf_ipv4(sk)	((sk)->sk_family == PF_INET)
+
+int quic_get_user_addr(struct sock *sk, union quic_addr *a,
+		       struct sockaddr *addr, int addr_len, bool any)
+{
+	memset(a, 0, sizeof(*a));
+	return quic_pf_ipv4(sk) ?
+	       quic_v4_get_user_addr(sk, a, addr, addr_len, any) :
+	       quic_v6_get_user_addr(sk, a, addr, addr_len, any);
+}
 
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 		      union quic_addr *addr)
