@@ -32,6 +32,7 @@ int quic_get_mtu_info(struct sk_buff *skb, u32 *info);
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 		      union quic_addr *addr);
 int quic_get_sk_addr(struct socket *sock, struct sockaddr *a, int peer);
+void quic_set_sk_addr(struct sock *sk, union quic_addr *a, bool src);
 void quic_set_sk_ecn(struct sock *sk, u8 ecn);
 
 int quic_get_dev_if(struct sock *sk, union quic_addr *a);

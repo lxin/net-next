@@ -11,6 +11,7 @@
  */
 
 #include <net/proto_memory.h>
+#include <crypto/utils.h>
 
 #include "socket.h"
 
@@ -992,150 +993,1140 @@ quic_frame_streams_blocked_bidi_create(struct sock *sk, void *data, u8 type,
 static int quic_frame_crypto_process(struct sock *sk, struct quic_frame *frame,
 				     u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_frame *nframe;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 offset, length;
+	int err;
+
+	if (!quic_get_var(&p, &len, &offset))
+		return -EINVAL;
+	if (!quic_get_var(&p, &len, &length) || length > len)
+		return -EINVAL;
+	if (!length)
+		goto out;
+	/* rfc9000#section-19.6:
+	 *
+	 * The largest offset delivered on a stream -- the sum of the offset
+	 * and data length -- cannot exceed 2^62-1. Receipt of a frame that
+	 * exceeds this limit MUST be treated as a connection error of type
+	 * FRAME_ENCODING_ERROR or CRYPTO_BUFFER_EXCEEDED.
+	 */
+	if (offset + length > QUIC_VARINT_8BYTE_MAX) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	/* Allocate a new frame for the crypto payload. Avoid copying: reuse
+	 * the existing buffer by pointing to 'p' and holding the skb.
+	 */
+	nframe = quic_frame_alloc(length, p, gfp);
+	if (!nframe)
+		return -ENOMEM;
+	nframe->skb = skb_get(frame->skb);
+
+	nframe->offset = offset;
+	nframe->level = frame->level;
+	nframe->bytes = nframe->len;
+
+	/* Submit the CRYPTO frame to inqueue for reassembly and processing. */
+	err = quic_inq_handshake_recv(sk, nframe, gfp);
+	if (err) {
+		frame->errcode = nframe->errcode; /* Propagate error reason. */
+		quic_frame_put(nframe);
+		return err;
+	}
+out:
+	len -= length;
+	/* Return number of bytes consumed from the original frame. */
+	return (int)(frame->len - len);
+}
+
+static int quic_frame_stream_error(struct quic_stream *stream,
+				   struct quic_frame *frame)
+{
+	int err = PTR_ERR(stream);
+
+	if (err == -ENOSTR) /* Stream already released. */
+		return 0;
+	if (err == -ENOMEM)
+		return err;
+	if (err == -EAGAIN)
+		frame->errcode = QUIC_TRANSPORT_ERROR_STREAM_LIMIT;
+	else
+		frame->errcode = QUIC_TRANSPORT_ERROR_STREAM_STATE;
+	return err;
 }
 
 static int quic_frame_stream_process(struct sock *sk, struct quic_frame *frame,
 				     u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	u64 stream_id, payload_len, offset = 0;
+	struct quic_stream *stream;
+	struct quic_frame *nframe;
+	u8 *p = frame->data, fin;
+	u32 len = frame->len;
+	int err;
+
+	if (!quic_get_var(&p, &len, &stream_id))
+		return -EINVAL;
+	if (type & QUIC_STREAM_BIT_OFF) {
+		if (!quic_get_var(&p, &len, &offset))
+			return -EINVAL;
+	}
+
+	payload_len = len;
+	if (type & QUIC_STREAM_BIT_LEN) {
+		if (!quic_get_var(&p, &len, &payload_len) || payload_len > len)
+			return -EINVAL;
+	}
+	fin = !!(type & QUIC_STREAM_BIT_FIN);
+	if (!payload_len && !fin)
+		goto out;
+	/* rfc9000#section-19.8:
+	 *
+	 * The largest offset delivered on a stream -- the sum of the offset
+	 * and data length -- cannot exceed 2^62-1, as it is not possible to
+	 * provide flow control credit for that data. Receipt of a frame that
+	 * exceeds this limit MUST be treated as a connection error of type
+	 * FRAME_ENCODING_ERROR or FLOW_CONTROL_ERROR.
+	 */
+	if (offset + payload_len > QUIC_VARINT_8BYTE_MAX) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	/* Look up the stream for receiving data (may create it if valid). */
+	stream = quic_stream_get(streams, (s64)stream_id, MSG_QUIC_STREAM_NEW,
+				 quic_is_serv(sk), false, gfp);
+	if (IS_ERR(stream)) {
+		/* rfc9000#section-4.6:
+		 *
+		 * An endpoint that receives a frame with a stream ID exceeding
+		 * the limit it has sent MUST treat this as a connection error
+		 * of type STREAM_LIMIT_ERROR.
+		 *
+		 * rfc9000#section-19.8:
+		 *
+		 * An endpoint MUST terminate the connection with error
+		 * STREAM_STATE_ERROR if it receives a STREAM frame for a
+		 * locally initiated stream that has not yet been created, or
+		 * for a send-only stream.
+		 */
+		err = quic_frame_stream_error(stream, frame);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	/* Skip if stream already finished receiving, was reset, or
+	 * stop-sending requested.
+	 */
+	if (stream->recv.state >= QUIC_STREAM_RECV_STATE_RECVD ||
+	    stream->recv.stop_sent)
+		goto out;
+
+	/* Follows the same processing logic as quic_frame_crypto_process(). */
+	nframe = quic_frame_alloc(payload_len, p, gfp);
+	if (!nframe)
+		return -ENOMEM;
+	nframe->skb = skb_get(frame->skb);
+
+	nframe->offset = offset;
+	nframe->stream = stream;
+	nframe->stream_fin = fin;
+	nframe->level = frame->level;
+	nframe->bytes = nframe->len;
+
+	err = quic_inq_stream_recv(sk, nframe, gfp);
+	if (err) {
+		frame->errcode = nframe->errcode;
+		quic_frame_put(nframe);
+		return err;
+	}
+
+out:
+	len -= payload_len;
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_ack_process(struct sock *sk, struct quic_frame *frame,
 				  u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	u64 largest, smallest, range, delay, count, gap, i;
+	u8 *p = frame->data, level = frame->level;
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_cong *cong = quic_cong(sk);
+	u64 ecn_count[QUIC_ECN_MAX];
+	struct quic_pnspace *space;
+	u32 len = frame->len;
+	s64 max_pn_acked;
+
+	if (!quic_get_var(&p, &len, &largest) ||
+	    !quic_get_var(&p, &len, &delay) ||
+	    !quic_get_var(&p, &len, &count) || count > QUIC_PN_MAP_MAX_GABS ||
+	    !quic_get_var(&p, &len, &range))
+		return -EINVAL;
+
+	space = quic_pnspace(sk, level);
+	if ((s64)largest >= space->next_pn) {
+		/* rfc9000#section-13.1:
+		 *
+		 * An endpoint SHOULD treat receipt of an acknowledgment for a
+		 * packet it did not send as a connection error of type
+		 * PROTOCOL_VIOLATION, if it is able to detect the condition.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+	max_pn_acked = space->max_pn_acked_seen;
+	quic_pnspace_reset_ecn_acked(space);
+
+	/* rfc9000#section-19.3.1:
+	 *
+	 * smallest = largest - ack_range.
+	 *
+	 * If any computed packet number is negative, an endpoint MUST generate
+	 * a connection error of type FRAME_ENCODING_ERROR.
+	 */
+	if (range > largest) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+	smallest = largest - range;
+	/* Calculate ACK Delay, adjusted by the ACK delay exponent. */
+	delay <<= inq->ack_delay_exponent;
+	/* ACK transmitted packets within [smallest, largest] range. */
+	quic_outq_transmitted_sack(sk, level, (s64)largest, (s64)smallest,
+				   (s64)largest, delay, gfp);
+
+	for (i = 0; i < count; i++) {
+		if (!quic_get_var(&p, &len, &gap) ||
+		    !quic_get_var(&p, &len, &range))
+			return -EINVAL;
+		/* rfc9000#section-19.3.1:
+		 *
+		 * smallest = largest - ack_range;
+		 * largest = previous_smallest - gap - 2.
+		 *
+		 * If any computed packet number is negative, an endpoint MUST
+		 * generate a connection error of type FRAME_ENCODING_ERROR.
+		 */
+		if (gap + 2 > smallest || range > smallest - gap - 2) {
+			frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+			return -EINVAL;
+		}
+		largest = smallest - gap - 2;
+		smallest = largest - range;
+		quic_outq_transmitted_sack(sk, level, (s64)largest,
+					   (s64)smallest, -1, 0, gfp);
+	}
+
+	if (type != QUIC_FRAME_ACK_ECN)
+		goto out;
+
+	if (!quic_get_var(&p, &len, &ecn_count[QUIC_ECN_ECT0]) ||
+	    !quic_get_var(&p, &len, &ecn_count[QUIC_ECN_ECT1]) ||
+	    !quic_get_var(&p, &len, &ecn_count[QUIC_ECN_CE]))
+		return -EINVAL;
+
+	/* rfc9000#section-13.4.2.1:
+	 *
+	 * Validating ECN counts from reordered ACK frames can result in
+	 * failure. An endpoint MUST NOT fail ECN validation as a result of
+	 * processing an ACK frame that does not increase the largest
+	 * acknowledged packet number.
+	 */
+	if (space->max_pn_acked_seen > max_pn_acked &&
+	    !quic_pnspace_validate_ecn(space, ecn_count)) {
+		quic_set_sk_ecn(sk, 0);
+		goto out;
+	}
+	if (quic_pnspace_set_ecn_peer(space, ecn_count)) {
+		quic_cong_on_process_ecn(cong);
+		quic_outq_sync_window(sk, cong->window);
+	}
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_new_conn_id_process(struct sock *sk,
 					  struct quic_frame *frame, u8 type,
 					  gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_conn_id_set *id_set = quic_dest(sk);
+	u64 seqno, prior, length, first;
+	struct quic_conn_id dcid = {};
+	u8 *p = frame->data, *token;
+	u32 len = frame->len;
+	int err;
+
+	if (!quic_conn_id_active(id_set)->len) {
+		/* rfc9000#section-19.15:
+		 *
+		 * An endpoint that is sending packets with a zero-length
+		 * Destination Connection ID MUST treat receipt of a
+		 * NEW_CONNECTION_ID frame as a connection error of type
+		 * PROTOCOL_VIOLATION.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+	if (!quic_get_var(&p, &len, &seqno) || seqno > U32_MAX ||
+	    !quic_get_var(&p, &len, &prior) ||
+	    !quic_get_var(&p, &len, &length) ||
+	    !length || length > QUIC_CONN_ID_MAX_LEN ||
+	    length + QUIC_CONN_ID_TOKEN_LEN > len)
+		return -EINVAL;
+
+	memcpy(dcid.data, p, length);
+	dcid.len = (u8)length;
+	token = p + length;
+
+	if (prior > seqno) {
+		/* rfc9000#section-19.15:
+		 *
+		 * The value in the Retire Prior To field MUST be less than or
+		 * equal to the value in the Sequence Number field. Receiving a
+		 * value in the Retire Prior To field that is greater than that
+		 * in the Sequence Number field MUST be treated as a connection
+		 * error of type FRAME_ENCODING_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	first = quic_conn_id_first_number(id_set);
+	if (seqno < first) /* This seqno was already used, skip processing. */
+		goto out;
+	if (prior < first)
+		prior = first;
+	if (seqno - prior + 1 > id_set->max_count) {
+		/* rfc9000#section-5.1.1:
+		 *
+		 * After processing a NEW_CONNECTION_ID frame and adding and
+		 * retiring active connection IDs, if the number of active
+		 * connection IDs exceeds the value advertised in its
+		 * active_connection_id_limit transport parameter, an endpoint
+		 * MUST close the connection with an error of type
+		 * CONNECTION_ID_LIMIT_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_CONNECTION_ID_LIMIT;
+		return -EINVAL;
+	}
+
+	err = quic_conn_id_add(id_set, &dcid, seqno, token, gfp);
+	if (err)
+		return err;
+
+	/* If path migration is pending due to missing connection IDs, trigger
+	 * probing on the alternate path to continue the migration.
+	 */
+	if (quic_path_alt_state(quic_paths(sk), QUIC_PATH_ALT_PENDING))
+		quic_outq_probe_path_alt(sk, true, gfp);
+
+out:
+	/* rfc9000#section-5.1.2:
+	 *
+	 * Upon receipt of an increased Retire Prior To field, the peer MUST
+	 * stop using the corresponding connection IDs and retire them with
+	 * RETIRE_CONNECTION_ID frames before adding the newly provided
+	 * connection ID to the set of active connection IDs.
+	 */
+	if (prior > first && prior <= quic_conn_id_last_number(id_set)) {
+		err = quic_outq_transmit_retire_conn_id(sk, prior, frame->path,
+							true, gfp);
+		if (err)
+			return err;
+	}
+
+	len -= (length + QUIC_CONN_ID_TOKEN_LEN);
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_retire_conn_id_process(struct sock *sk,
 					     struct quic_frame *frame, u8 type,
 					     gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_conn_id_set *id_set = quic_source(sk);
+	struct quic_connection_id_info info = {};
+	struct quic_conn_id *active;
+	u64 seqno, last, first;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_conn_id_active(id_set)->len) {
+		/* rfc9000#section-19.16:
+		 *
+		 * An endpoint that provides a zero-length connection ID MUST
+		 * treat receipt of a RETIRE_CONNECTION_ID frame as a
+		 * connection error of type PROTOCOL_VIOLATION.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+	if (!quic_get_var(&p, &len, &seqno) ||
+	    seqno + 1 + id_set->max_count > U32_MAX)
+		return -EINVAL;
+
+	if (QUIC_SKB_CB(frame->skb)->seqno == seqno) {
+		/* The sequence number specified in a RETIRE_CONNECTION_ID
+		 * frame MUST NOT refer to the Destination Connection ID field
+		 * of the packet in which the frame is contained. The peer MAY
+		 * treat this as a connection error of type PROTOCOL_VIOLATION.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+	first = quic_conn_id_first_number(id_set);
+	last  = quic_conn_id_last_number(id_set);
+	if (seqno >= first) {
+		if (seqno >= last) {
+			/* Receipt of a RETIRE_CONNECTION_ID frame containing a
+			 * sequence number greater than any previously sent to
+			 * the peer MUST be treated as a connection error of
+			 * type PROTOCOL_VIOLATION.
+			 */
+			frame->errcode =
+				QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+			return -EINVAL;
+		}
+
+		/* Notify application of connection IDs change. */
+		quic_conn_id_remove(id_set, seqno);
+		first = quic_conn_id_first_number(id_set);
+		info.prior_to = first;
+		active = quic_conn_id_active(id_set);
+		info.active = quic_conn_id_number(active);
+		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_ID, &info,
+				    sizeof(info), gfp);
+	}
+
+	/* rfc9000#section-5.1.2:
+	 *
+	 * Sending a RETIRE_CONNECTION_ID frame indicates that the connection
+	 * ID will not be used again and requests that the peer replace it with
+	 * a new connection ID using a NEW_CONNECTION_ID frame.
+	 */
+	err = quic_outq_transmit_new_conn_id(sk, first, frame->path, true,
+					     gfp);
+	if (err)
+		return err;
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_new_token_process(struct sock *sk,
 					struct quic_frame *frame, u8 type,
 					gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_data *token = quic_token(sk);
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 length;
+
+	if (quic_is_serv(sk)) {
+		/* rfc9000#section-19.7:
+		 *
+		 * A server MUST treat receipt of a NEW_TOKEN frame as a
+		 * connection error of type PROTOCOL_VIOLATION.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+
+	if (!quic_get_var(&p, &len, &length) || length > len ||
+	    length > QUIC_TOKEN_MAX_LEN)
+		return -EINVAL;
+	if (!length) {
+		/* rfc9000#section-19.7:
+		 *
+		 * The token MUST NOT be empty. A client MUST treat receipt of
+		 * a NEW_TOKEN frame with an empty Token field as a connection
+		 * error of type FRAME_ENCODING_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	/* Store the token internally so user space can retrieve it via
+	 * getsockopt().
+	 */
+	if (quic_data_dup(token, p, length, gfp))
+		return -ENOMEM;
+	/* Notify upper layers that a valid NEW_TOKEN was received. */
+	quic_inq_event_recv(sk, QUIC_EVENT_NEW_TOKEN, token->data, token->len,
+			    gfp);
+
+	len -= length;
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_handshake_done_process(struct sock *sk,
 					     struct quic_frame *frame, u8 type,
 					     gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_path_group *paths = quic_paths(sk);
+
+	if (quic_is_serv(sk)) {
+		/* rfc9000#section-19.20:
+		 *
+		 * A server MUST treat receipt of a HANDSHAKE_DONE frame as a
+		 * connection error of type PROTOCOL_VIOLATION.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+
+	/* Handshake is complete and clean up transmitted handshake packets. */
+	quic_outq_transmitted_sack(sk, QUIC_CRYPTO_HANDSHAKE, QUIC_PN_MAX, 0,
+				   -1, 0, gfp);
+
+	if (paths->pref_addr) {
+		/* Initiate probing on the new path to validate it (e.g., send
+		 * PATH_CHALLENGE).  This starts the connection migration
+		 * procedure.
+		 */
+		quic_outq_probe_path_alt(sk, true, gfp);
+		paths->pref_addr = 0;
+	}
+	return 0;
 }
 
 static int quic_frame_padding_process(struct sock *sk, struct quic_frame *frame,
 				      u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	u8 *p = frame->data;
+
+	/* Some implementations put the PADDING frame ahead of other frames.
+	 * We need to skip over zero bytes and find the first non-zero byte,
+	 * which marks the start of the next frame.
+	 */
+	for (; p != frame->data + frame->len && !(*p); p++)
+		;
+	return (int)(p - frame->data);
 }
 
 static int quic_frame_ping_process(struct sock *sk, struct quic_frame *frame,
 				   u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	return 0; /* No content. */
 }
 
 static int quic_frame_path_challenge_process(struct sock *sk,
 					     struct quic_frame *frame, u8 type,
 					     gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	u8 entropy[QUIC_PATH_ENTROPY_LEN];
+	u32 len = frame->len;
+	int err;
+
+	if (len < QUIC_PATH_ENTROPY_LEN)
+		return -EINVAL;
+	/* rfc9000#section-19.17:
+	 *
+	 * The recipient of this frame MUST generate a PATH_RESPONSE frame
+	 * containing the same Data value.
+	 */
+	memcpy(entropy, frame->data, QUIC_PATH_ENTROPY_LEN);
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_PATH_RESPONSE, entropy,
+				       frame->path, true, gfp);
+	if (err)
+		return err;
+
+	len -= QUIC_PATH_ENTROPY_LEN;
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_reset_stream_process(struct sock *sk,
 					   struct quic_frame *frame, u8 type,
 					   gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_stream_update update = {};
+	u64 stream_id, errcode, finalsz;
+	struct quic_stream *stream;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_get_var(&p, &len, &stream_id) ||
+	    !quic_get_var(&p, &len, &errcode) ||
+	    !quic_get_var(&p, &len, &finalsz))
+		return -EINVAL;
+
+	stream = quic_stream_get(streams, (s64)stream_id, MSG_QUIC_STREAM_NEW,
+				 quic_is_serv(sk), false, gfp);
+	if (IS_ERR(stream)) {
+		/* rfc9000#section-19.4:
+		 *
+		 * An endpoint that receives a RESET_STREAM frame for a
+		 * send-only stream MUST terminate the connection with error
+		 * STREAM_STATE_ERROR.
+		 */
+		err = quic_frame_stream_error(stream, frame);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	if (stream->recv.state >= QUIC_STREAM_RECV_STATE_RECVD)
+		goto out; /* Skip if stream has received all data or a reset. */
+
+	if (finalsz < stream->recv.highest ||
+	    finalsz > stream->recv.max_bytes ||
+	    (stream->recv.state == QUIC_STREAM_RECV_STATE_SIZE_KNOWN &&
+	     stream->recv.finalsz != finalsz)) {
+		/* rfc9000#section-4.5:
+		 *
+		 * Once a final size for a stream is known, it cannot change.
+		 * If a RESET_STREAM or STREAM frame is received indicating a
+		 * change in the final size for the stream, an endpoint SHOULD
+		 * respond with an error of type FINAL_SIZE_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_FINAL_SIZE;
+		return -EINVAL;
+	}
+
+	/* Notify that stream has received a reset. */
+	update.id = (s64)stream_id;
+	update.state = QUIC_STREAM_RECV_STATE_RESET_RECVD;
+	update.errcode = errcode;
+	update.finalsz = finalsz;
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_UPDATE, &update,
+			    sizeof(update), gfp);
+
+	/* rfc9000#section-3.2:
+	 *
+	 * Receiving a RESET_STREAM frame in the "Recv" or "Size Known" state
+	 * causes the stream to enter the "Reset Recvd" state.
+	 */
+	stream->recv.state = update.state;
+	stream->recv.finalsz = update.finalsz;
+
+	/* rfc9000#section-19.4:
+	 *
+	 * A receiver of RESET_STREAM can discard any data that it already
+	 * received on that stream.
+	 */
+	quic_inq_list_purge(sk, &inq->stream_list, stream);
+	quic_inq_list_purge(sk, &inq->early_list, stream);
+	quic_inq_list_purge(sk, &inq->recv_list, stream);
+
+	/* Account remaining stream data as consumed for connection-level flow
+	 * control. Otherwise inq->bytes diverges from peer outq->bytes after
+	 * RESET_STREAM.
+	 */
+	inq->highest += (finalsz - stream->recv.highest);
+	quic_inq_flow_control(sk, NULL, finalsz - stream->recv.bytes, gfp);
+
+	/* Release the receive stream. */
+	quic_stream_put(streams, stream, quic_is_serv(sk), false);
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_stop_sending_process(struct sock *sk,
 					   struct quic_frame *frame, u8 type,
 					   gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream_update update = {};
+	struct quic_stream *stream;
+	struct quic_errinfo info;
+	u64 stream_id, errcode;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_get_var(&p, &len, &stream_id) ||
+	    !quic_get_var(&p, &len, &errcode))
+		return -EINVAL;
+
+	stream = quic_stream_get(streams, (s64)stream_id, MSG_QUIC_STREAM_NEW,
+				 quic_is_serv(sk), true, gfp);
+	if (IS_ERR(stream)) {
+		/* rfc9000#section-19.5:
+		 *
+		 * Receiving a STOP_SENDING frame for a locally initiated
+		 * stream that has not yet been created MUST be treated as a
+		 * connection error of type STREAM_STATE_ERROR.  An endpoint
+		 * that receives a STOP_SENDING frame for a receive-only stream
+		 * MUST terminate the connection with error STREAM_STATE_ERROR.
+		 */
+		err = quic_frame_stream_error(stream, frame);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	if (stream->send.state >= QUIC_STREAM_SEND_STATE_RECVD)
+		goto out;
+
+	/* rfc9000#section-3.1:
+	 *
+	 * Alternatively, an endpoint might receive a STOP_SENDING frame from
+	 * its peer. In either case, the endpoint sends a RESET_STREAM frame,
+	 * which causes the stream to enter the "Reset Sent" state.
+	 */
+	info.stream_id = (s64)stream_id;
+	info.errcode = errcode;
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_RESET_STREAM, &info, 0,
+				       true, gfp);
+	if (err)
+		return err;
+
+	/* Notify that stream has received a stop_sending and sent a reset. */
+	update.id = (s64)stream_id;
+	update.state = QUIC_STREAM_SEND_STATE_RESET_SENT;
+	update.errcode = errcode;
+	update.finalsz = stream->send.bytes;
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_UPDATE, &update,
+			    sizeof(update), gfp);
+
+	stream->send.state = update.state;
+	sk->sk_write_space(sk);
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_max_data_process(struct sock *sk,
 				       struct quic_frame *frame, u8 type,
 				       gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_outqueue *outq = quic_outq(sk);
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 max_bytes;
+
+	if (!quic_get_var(&p, &len, &max_bytes))
+		return -EINVAL;
+
+	if (max_bytes > outq->max_bytes) {
+		/* Update only if the peer increases the allowed send data.
+		 * Wake up processes blocked while attempting to send more
+		 * data.
+		 */
+		outq->max_bytes = max_bytes;
+		sk->sk_write_space(sk);
+	}
+
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_max_stream_data_process(struct sock *sk,
 					      struct quic_frame *frame, u8 type,
 					      gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream_max_data data;
+	struct quic_stream *stream;
+	u64 max_bytes, stream_id;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_get_var(&p, &len, &stream_id) ||
+	    !quic_get_var(&p, &len, &max_bytes))
+		return -EINVAL;
+
+	stream = quic_stream_get(streams, (s64)stream_id, MSG_QUIC_STREAM_NEW,
+				 quic_is_serv(sk), true, gfp);
+	if (IS_ERR(stream)) {
+		/* rfc9000#section-19.10:
+		 *
+		 * Receiving a MAX_STREAM_DATA frame for a locally initiated
+		 * stream that has not yet been created MUST be treated as a
+		 * connection error of type STREAM_STATE_ERROR. An endpoint
+		 * that receives a MAX_STREAM_DATA frame for a receive-only
+		 * stream MUST terminate the connection with error
+		 * STREAM_STATE_ERROR.
+		 */
+		err = quic_frame_stream_error(stream, frame);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	if (max_bytes > stream->send.max_bytes) {
+		/* Update only if the peer increases the allowed send data.
+		 * Wake up processes blocked while attempting to send more
+		 * data.
+		 */
+		stream->send.max_bytes = max_bytes;
+		sk->sk_write_space(sk);
+		/* Notify the application of updated per-stream flow control.
+		 * This is useful for userspace to prioritize or schedule data
+		 * transmission across multiple streams.
+		 */
+		data.id = stream->id;
+		data.max_data = max_bytes;
+		quic_inq_event_recv(sk, QUIC_EVENT_STREAM_MAX_DATA, &data,
+				    sizeof(data), gfp);
+	}
+out:
+	return (int)(frame->len - len);
 }
+
+#define QUIC_MAX_STREAMS_LIMIT	BIT_ULL(60)
 
 static int quic_frame_max_streams_uni_process(struct sock *sk,
 					      struct quic_frame *frame,
 					      u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	s64 stream_id = streams->send.max_uni_stream_id;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 max;
+
+	if (!quic_get_var(&p, &len, &max))
+		return -EINVAL;
+
+	if (max > QUIC_MAX_STREAMS_LIMIT) {
+		/* rfc9000#section-19.11:
+		 *
+		 * This value cannot exceed 2^60, as it is not possible to
+		 * encode stream IDs larger than 2^62-1. Receipt of a frame
+		 * that permits opening of a stream larger than this limit MUST
+		 * be treated as a connection error of type
+		 * FRAME_ENCODING_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	/* rfc9000#section-19.11:
+	 *
+	 * Loss or reordering can cause an endpoint to receive a MAX_STREAMS
+	 * frame with a lower stream limit than was previously received.
+	 * MAX_STREAMS frames that do not increase the stream limit MUST be
+	 * ignored.
+	 */
+	if (max <= quic_stream_id_to_streams(stream_id))
+		goto out;
+
+	type = QUIC_STREAM_TYPE_CLIENT_UNI;
+	if (quic_is_serv(sk))
+		type = QUIC_STREAM_TYPE_SERVER_UNI;
+	/* Notify the application of updated maximum uni-directional stream ID
+	 * allowed to open.
+	 */
+	stream_id = quic_stream_streams_to_id(max, type);
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_MAX_STREAM, &stream_id,
+			    sizeof(stream_id), gfp);
+
+	streams->send.max_uni_stream_id = stream_id;
+	/* Wake up processes blocked while attempting to open a stream. */
+	sk->sk_write_space(sk);
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_max_streams_bidi_process(struct sock *sk,
 					       struct quic_frame *frame,
 					       u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	s64 stream_id;
+	u64 max;
+
+	if (!quic_get_var(&p, &len, &max))
+		return -EINVAL;
+
+	/* Similar to quic_frame_max_streams_uni_process(), but applies to
+	 * bidirectional streams.
+	 */
+	if (max > QUIC_MAX_STREAMS_LIMIT) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+
+	stream_id = streams->send.max_bidi_stream_id;
+	if (max <= quic_stream_id_to_streams(stream_id))
+		goto out;
+
+	type = QUIC_STREAM_TYPE_CLIENT_BIDI;
+	if (quic_is_serv(sk))
+		type = QUIC_STREAM_TYPE_SERVER_BIDI;
+	stream_id = quic_stream_streams_to_id(max, type);
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_MAX_STREAM, &stream_id,
+			    sizeof(stream_id), gfp);
+
+	streams->send.max_bidi_stream_id = stream_id;
+	sk->sk_write_space(sk);
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_connection_close_process(struct sock *sk,
 					       struct quic_frame *frame,
 					       u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_connection_close c = {};
+	u64 err_code, phrase_len, ftype = 0;
+	u8 *p = frame->data, *data = NULL;
+	u32 len = frame->len;
+
+	if (!quic_get_var(&p, &len, &err_code))
+		return -EINVAL;
+	if (type == QUIC_FRAME_CONNECTION_CLOSE &&
+	    !quic_get_var(&p, &len, &ftype))
+		return -EINVAL;
+
+	if (!quic_get_var(&p, &len, &phrase_len) || phrase_len > len)
+		return -EINVAL;
+
+	/* Notify that the peer closed connection with error info. */
+	if (phrase_len) {
+		if (phrase_len > QUIC_CLOSE_PHRASE_BUFFER_SIZE - 1)
+			phrase_len = QUIC_CLOSE_PHRASE_BUFFER_SIZE - 1;
+		memcpy(c.phrase, p, phrase_len);
+		data = kmemdup(c.phrase, phrase_len + 1, gfp);
+	}
+	if (type == QUIC_FRAME_CONNECTION_CLOSE)
+		QUIC_INC_STATS(sock_net(sk), QUIC_MIB_FRM_INCLOSES);
+	c.errcode = err_code;
+	c.frame = (u8)ftype;
+	quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_CLOSE, &c, sizeof(c),
+			    gfp);
+
+	/* Save close frame info so that user space can retrieve it via
+	 * getsockopt().
+	 */
+	outq->close_errcode = err_code;
+	outq->close_frame = (u8)ftype;
+	kfree(outq->close_phrase);
+	outq->close_phrase = data;
+
+	quic_set_state(sk, QUIC_SS_CLOSED);
+	pr_debug("%s: level: %d, errcode: %d, frame: %d\n", __func__,
+		 frame->level, c.errcode, c.frame);
+
+	/* Stop processing further frames after a CLOSE frame. */
+	return (int)frame->len;
 }
 
 static int quic_frame_data_blocked_process(struct sock *sk,
 					   struct quic_frame *frame, u8 type,
 					   gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_inqueue *inq = quic_inq(sk);
+	u64 window, max_bytes, recv_max_bytes;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_get_var(&p, &len, &max_bytes))
+		return -EINVAL;
+
+	/* rfc9000#section-19.12:
+	 *
+	 * DATA_BLOCKED frames can be used as input to tuning of flow control
+	 * algorithms.
+	 *
+	 * Similar to quic_inq_flow_control(), but MAX_DATA is sent
+	 * unconditionally.
+	 */
+	window = inq->max_data;
+	if (sk_under_memory_pressure(sk))
+		window >>= 1;
+	recv_max_bytes = inq->max_bytes;
+	if (recv_max_bytes >= inq->bytes + window)
+		goto out;
+
+	inq->max_bytes = inq->bytes + window;
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_MAX_DATA, inq, 0, true,
+				       gfp);
+	if (err) {
+		/* If sending fails, restore previous max_bytes value. */
+		inq->max_bytes = recv_max_bytes;
+		return err;
+	}
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_stream_data_blocked_process(struct sock *sk,
 						  struct quic_frame *frame,
 						  u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	u64 stream_id, max_bytes, recv_max_bytes;
+	u32 window, len = frame->len;
+	struct quic_stream *stream;
+	u8 *p = frame->data;
+	int err;
+
+	if (!quic_get_var(&p, &len, &stream_id) ||
+	    !quic_get_var(&p, &len, &max_bytes))
+		return -EINVAL;
+
+	stream = quic_stream_get(streams, (s64)stream_id, MSG_QUIC_STREAM_NEW,
+				 quic_is_serv(sk), false, gfp);
+	if (IS_ERR(stream)) {
+		/* rfc9000#section-19.13:
+		 *
+		 * An endpoint that receives a STREAM_DATA_BLOCKED frame for a
+		 * send-only stream MUST terminate the connection with error
+		 * STREAM_STATE_ERROR.
+		 */
+		err = quic_frame_stream_error(stream, frame);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	if (stream->recv.state >= QUIC_STREAM_RECV_STATE_RECVD)
+		goto out; /* Skip if stream has received all data or a reset. */
+
+	/* Follows the same processing logic as
+	 * quic_frame_data_blocked_process().
+	 */
+	window = stream->recv.window;
+	if (sk_under_memory_pressure(sk))
+		window >>= 1;
+	recv_max_bytes = stream->recv.max_bytes;
+	if (recv_max_bytes >= stream->recv.bytes + window)
+		goto out;
+
+	stream->recv.max_bytes = stream->recv.bytes + window;
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_MAX_STREAM_DATA, stream,
+				       0, true, gfp);
+	if (err) {
+		stream->recv.max_bytes = recv_max_bytes;
+		return err;
+	}
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_streams_blocked_uni_process(struct sock *sk,
 						  struct quic_frame *frame,
 						  u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	s64 stream_id = streams->recv.max_uni_stream_id;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 max;
+	int err;
+
+	if (!quic_get_var(&p, &len, &max))
+		return -EINVAL;
+	if (max > QUIC_MAX_STREAMS_LIMIT) {
+		/* rfc9000#section-19.14:
+		 *
+		 * This value cannot exceed 2^60, as it is not possible to
+		 * encode stream IDs larger than 2^62-1. Receipt of a frame
+		 * that encodes a larger stream ID MUST be treated as a
+		 * connection error of type STREAM_LIMIT_ERROR or
+		 * FRAME_ENCODING_ERROR.
+		 */
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+	if (max > quic_stream_id_to_streams(stream_id))
+		goto out; /* Peer requested more streams than allowed. */
+	/* Respond with a MAX_STREAMS_UNI frame to inform the peer of the
+	 * current limit.
+	 */
+	max = quic_stream_id_to_streams(stream_id);
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_MAX_STREAMS_UNI, &max, 0,
+				       true, gfp);
+	if (err)
+		return err;
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_streams_blocked_bidi_process(struct sock *sk,
 						   struct quic_frame *frame,
 						   u8 type, gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_stream_table *streams = quic_streams(sk);
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	s64 stream_id;
+	u64 max;
+	int err;
+
+	if (!quic_get_var(&p, &len, &max))
+		return -EINVAL;
+	/* Follows the same processing logic as
+	 * quic_frame_streams_blocked_uni_process().
+	 */
+	if (max > QUIC_MAX_STREAMS_LIMIT) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+		return -EINVAL;
+	}
+	stream_id = streams->recv.max_bidi_stream_id;
+	if (max > quic_stream_id_to_streams(stream_id))
+		goto out;
+	max = quic_stream_id_to_streams(stream_id);
+	err = quic_outq_transmit_frame(sk, QUIC_FRAME_MAX_STREAMS_BIDI, &max, 0,
+				       true, gfp);
+	if (err)
+		return err;
+out:
+	return (int)(frame->len - len);
 }
 
 static int quic_frame_path_response_process(struct sock *sk,
 					    struct quic_frame *frame, u8 type,
 					    gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_path_group *paths = quic_paths(sk);
+	u8 local, entropy[QUIC_PATH_ENTROPY_LEN];
+	u32 len = frame->len;
+
+	if (len < QUIC_PATH_ENTROPY_LEN)
+		return -EINVAL;
+
+	/* Verify path challenge entropy. */
+	memcpy(entropy, frame->data, QUIC_PATH_ENTROPY_LEN);
+	if (crypto_memneq(paths->entropy, entropy, QUIC_PATH_ENTROPY_LEN))
+		goto out;
+
+	/* Peer App key ready; clean transmitted handshake packets. */
+	quic_outq_transmitted_sack(sk, QUIC_CRYPTO_HANDSHAKE, QUIC_PN_MAX, 0,
+				   -1, 0, gfp);
+
+	if (!quic_path_alt_state(paths, QUIC_PATH_ALT_PROBING))
+		goto out;
+
+	/* If this was a probe for connection migration, Promotes the alternate
+	 * path (path[1]) to become the new active path.
+	 */
+	sk->sk_prot->unhash(sk);
+	quic_path_swap(paths);
+	quic_set_sk_addr(sk, quic_path_saddr(paths, 0), 1);
+	quic_set_sk_addr(sk, quic_path_daddr(paths, 0), 0);
+	sk->sk_prot->hash(sk);
+	/* Notify application of updated path; indicate whether it is a local
+	 * address change.
+	 */
+	local = !quic_cmp_sk_addr(sk, quic_path_saddr(paths, 1),
+				  quic_path_saddr(paths, 0));
+	quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_MIGRATION, &local,
+			    sizeof(local), gfp);
+
+	/* Update path ID for all control and transmitted frames, reset route,
+	 * and use the active connection ID for the new path.
+	 */
+	frame->path = 0;
+	__sk_dst_reset(sk);
+	quic_outq_update_path(sk);
+	quic_conn_id_swap_active(quic_dest(sk));
+
+out:
+	len -= 8;
+	return (int)(frame->len - len);
 }
 
 static struct quic_frame *
@@ -1204,14 +2195,62 @@ static int quic_frame_invalid_process(struct sock *sk,
 				      struct quic_frame *frame, u8 type,
 				      gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	/* rfc9000#section-12.4:
+	 *
+	 * An endpoint MUST treat the receipt of a frame of unknown type as a
+	 * connection error of type FRAME_ENCODING_ERROR.
+	 */
+	frame->errcode = QUIC_TRANSPORT_ERROR_FRAME_ENCODING;
+	return -EPROTONOSUPPORT;
 }
 
 static int quic_frame_datagram_process(struct sock *sk,
 				       struct quic_frame *frame, u8 type,
 				       gfp_t gfp)
 {
-	return -EOPNOTSUPP;
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_frame *nframe;
+	u32 len = frame->len;
+	u8 *p = frame->data;
+	u64 payload_len;
+	int err;
+
+	payload_len = frame->len;
+	if (type == QUIC_FRAME_DATAGRAM_LEN) {
+		if (!quic_get_var(&p, &len, &payload_len) || payload_len > len)
+			return -EINVAL;
+	}
+	if (!payload_len)
+		goto out;
+
+	/* rfc9221#section-3:
+	 *
+	 * An endpoint that receives a DATAGRAM frame that is larger than the
+	 * value it sent in its max_datagram_frame_size transport parameter
+	 * MUST terminate the connection with an error of type
+	 * PROTOCOL_VIOLATION.
+	 */
+	if (payload_len + (p - frame->data) + 1 >
+	    inq->max_datagram_frame_size) {
+		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		return -EINVAL;
+	}
+
+	/* Follows the same processing logic as quic_frame_crypto_process(). */
+	nframe = quic_frame_alloc(payload_len, p, gfp);
+	if (!nframe)
+		return -ENOMEM;
+	nframe->skb = skb_get(frame->skb);
+	nframe->bytes = nframe->len;
+
+	err = quic_inq_dgram_recv(sk, nframe);
+	if (err) {
+		quic_frame_put(nframe);
+		return err;
+	}
+out:
+	len -= payload_len;
+	return (int)(frame->len - len);
 }
 
 static void quic_frame_padding_ack(struct sock *sk, struct quic_frame *frame,
@@ -1232,6 +2271,33 @@ static void quic_frame_ack_ack(struct sock *sk, struct quic_frame *frame,
 static void quic_frame_reset_stream_ack(struct sock *sk,
 					struct quic_frame *frame, gfp_t gfp)
 {
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream *stream = frame->stream;
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_stream_update update = {};
+
+	/* Notify that stream has been reset. */
+	update.id = stream->id;
+	update.state = QUIC_STREAM_SEND_STATE_RESET_RECVD;
+	update.errcode = stream->send.errcode;
+	update.finalsz = stream->send.bytes;
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_UPDATE, &update,
+			    sizeof(update), gfp);
+
+	/* rfc9000#section-3.1:
+	 *
+	 * Once a packet containing a RESET_STREAM has been acknowledged, the
+	 * sending part of the stream enters the "Reset Recvd" state, which is
+	 * a terminal state.
+	 */
+	stream->send.state = update.state;
+	/* Release the send stream. */
+	quic_outq_list_purge(sk, &outq->transmitted_list, stream);
+	quic_outq_list_purge(sk, &outq->control_list, stream);
+	quic_outq_list_purge(sk, &outq->stream_list, stream);
+	quic_stream_put(streams, stream, quic_is_serv(sk), true);
+	/* Wake up processes blocked while attempting to open a stream. */
+	sk->sk_write_space(sk);
 }
 
 static void quic_frame_stop_sending_ack(struct sock *sk,
@@ -1247,11 +2313,44 @@ static void quic_frame_crypto_ack(struct sock *sk, struct quic_frame *frame,
 static void quic_frame_new_token_ack(struct sock *sk, struct quic_frame *frame,
 				     gfp_t gfp)
 {
+	struct quic_outqueue *outq = quic_outq(sk);
+
+	outq->token_pending = 0; /* Clear to allow new NEW_TOKEN frame. */
 }
 
 static void quic_frame_stream_ack(struct sock *sk, struct quic_frame *frame,
 				  gfp_t gfp)
 {
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_stream *stream = frame->stream;
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_stream_update update = {};
+
+	stream->send.frags--;
+	if (stream->send.frags ||
+	    stream->send.state != QUIC_STREAM_SEND_STATE_SENT)
+		return; /* Skip if data in flight or stream not "Sent". */
+
+	/* Notify that stream received all data by peer. */
+	update.id = stream->id;
+	update.state = QUIC_STREAM_SEND_STATE_RECVD;
+	quic_inq_event_recv(sk, QUIC_EVENT_STREAM_UPDATE, &update,
+			    sizeof(update), gfp);
+
+	/* rfc9000#section-3.1:
+	 *
+	 * Once all stream data has been successfully acknowledged, the sending
+	 * part of the stream enters the "Data Recvd" state, which is a
+	 * terminal state.
+	 */
+	stream->send.state = update.state;
+	/* Release the send stream. */
+	quic_outq_list_purge(sk, &outq->transmitted_list, stream);
+	quic_outq_list_purge(sk, &outq->control_list, stream);
+	quic_outq_list_purge(sk, &outq->stream_list, stream);
+	quic_stream_put(streams, stream, quic_is_serv(sk), true);
+	/* Wake up processes blocked while attempting to open a stream. */
+	sk->sk_write_space(sk);
 }
 
 static void quic_frame_max_data_ack(struct sock *sk, struct quic_frame *frame,
@@ -1277,24 +2376,39 @@ static void quic_frame_max_streams_uni_ack(struct sock *sk,
 static void quic_frame_data_blocked_ack(struct sock *sk,
 					struct quic_frame *frame, gfp_t gfp)
 {
+	struct quic_outqueue *outq = quic_outq(sk);
+
+	outq->data_blocked = 0; /* Clear to allow new DATA_BLOCKED frame. */
 }
 
 static void quic_frame_stream_data_blocked_ack(struct sock *sk,
 					       struct quic_frame *frame,
 					       gfp_t gfp)
 {
+	struct quic_stream *stream = frame->stream;
+
+	/* Clear to allow new STREAM_DATA_BLOCKED frame. */
+	stream->send.data_blocked = 0;
 }
 
 static void quic_frame_streams_blocked_bidi_ack(struct sock *sk,
 						struct quic_frame *frame,
 						gfp_t gfp)
 {
+	struct quic_stream_table *streams = quic_streams(sk);
+
+	/* Clear to allow new STREAMS_BLOCKED_BIDI frame. */
+	streams->send.bidi_blocked = 0;
 }
 
 static void quic_frame_streams_blocked_uni_ack(struct sock *sk,
 					       struct quic_frame *frame,
 					       gfp_t gfp)
 {
+	struct quic_stream_table *streams = quic_streams(sk);
+
+	/* Clear to allow new STREAMS_BLOCKED_UNI frame. */
+	streams->send.uni_blocked = 0;
 }
 
 static void quic_frame_new_conn_id_ack(struct sock *sk,

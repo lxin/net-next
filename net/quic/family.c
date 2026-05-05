@@ -325,6 +325,40 @@ static int quic_v6_get_sk_addr(struct socket *sock, struct sockaddr *uaddr,
 	return sizeof(struct sockaddr_in6);
 }
 
+static void quic_v4_set_sk_addr(struct sock *sk, union quic_addr *a, bool src)
+{
+	if (src) {
+		inet_sk(sk)->inet_sport = a->v4.sin_port;
+		inet_sk(sk)->inet_saddr = a->v4.sin_addr.s_addr;
+	} else {
+		inet_sk(sk)->inet_dport = a->v4.sin_port;
+		inet_sk(sk)->inet_daddr = a->v4.sin_addr.s_addr;
+	}
+}
+
+static void quic_v6_copy_sk_addr(struct in6_addr *skaddr, union quic_addr *a)
+{
+	if (a->sa.sa_family == AF_INET) {
+		skaddr->s6_addr32[0] = 0;
+		skaddr->s6_addr32[1] = 0;
+		skaddr->s6_addr32[2] = htonl(0x0000ffff);
+		skaddr->s6_addr32[3] = a->v4.sin_addr.s_addr;
+	} else {
+		*skaddr = a->v6.sin6_addr;
+	}
+}
+
+static void quic_v6_set_sk_addr(struct sock *sk, union quic_addr *a, bool src)
+{
+	if (src) {
+		inet_sk(sk)->inet_sport = a->v4.sin_port;
+		quic_v6_copy_sk_addr(&sk->sk_v6_rcv_saddr, a);
+	} else {
+		inet_sk(sk)->inet_dport = a->v4.sin_port;
+		quic_v6_copy_sk_addr(&sk->sk_v6_daddr, a);
+	}
+}
+
 static void quic_v4_set_sk_ecn(struct sock *sk, u8 ecn)
 {
 	inet_sk(sk)->tos = ((inet_sk(sk)->tos & ~INET_ECN_MASK) | ecn);
@@ -404,6 +438,12 @@ int quic_get_sk_addr(struct socket *sock, struct sockaddr *a, int peer)
 {
 	return quic_pf_ipv4(sock->sk) ? quic_v4_get_sk_addr(sock, a, peer) :
 					quic_v6_get_sk_addr(sock, a, peer);
+}
+
+void quic_set_sk_addr(struct sock *sk, union quic_addr *a, bool src)
+{
+	quic_pf_ipv4(sk) ? quic_v4_set_sk_addr(sk, a, src) :
+			   quic_v6_set_sk_addr(sk, a, src);
 }
 
 void quic_set_sk_ecn(struct sock *sk, u8 ecn)
