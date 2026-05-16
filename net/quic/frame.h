@@ -185,6 +185,12 @@ static inline int quic_frame_size(struct quic_frame *frame)
 	return frame->bytes + sizeof(*frame);
 }
 
+int quic_frame_build_transport_params_ext(struct sock *sk,
+					  struct quic_transport_param *params,
+					  u8 *data, u32 *len);
+int quic_frame_parse_transport_params_ext(struct sock *sk,
+					  struct quic_transport_param *params,
+					  u8 *data, u32 len);
 int quic_frame_stream_append(struct sock *sk, struct quic_frame *frame,
 			     struct quic_msginfo *info, bool pack);
 

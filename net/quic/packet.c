@@ -143,6 +143,100 @@ static int quic_packet_version_change(struct sock *sk,
 	return 0;
 }
 
+static bool quic_packet_version_compatible(u32 version, u32 chosen)
+{
+	u32 *versions, i;
+
+	versions = quic_packet_compatible_versions(version);
+	if (!versions)
+		return false;
+
+	for (i = 1; versions[i]; i++)
+		if (versions[i] == chosen)
+			return true;
+	return false;
+}
+
+/* Select the best compatible QUIC version from offered list.
+ *
+ * Considers the local preferred version, currently chosen version, and
+ * versions offered by the peer. Selects the best compatible version based on
+ * client/server role and updates the connection version accordingly.
+ */
+int quic_packet_select_version(struct sock *sk, u32 *versions, u8 count)
+{
+	u32 version, preferred, chosen, best = 0;
+	u8 i, pref_found = 0, ch_found = 0;
+	int err = -EPROTONOSUPPORT;
+
+	preferred = quic_outq(sk)->version;
+	version = quic_packet(sk)->version;
+	chosen = versions[0];
+
+	for (i = 1; i < count; i++) {
+		if (!quic_packet_compatible_versions(versions[i]))
+			continue;
+		if (preferred == versions[i])
+			pref_found = 1;
+		if (chosen == versions[i])
+			ch_found = 1;
+		if (best < versions[i]) /* Track highest offered version. */
+			best = versions[i];
+	}
+	if (!pref_found && !ch_found && !best)
+		return err;
+
+	if (quic_is_serv(sk)) {
+		/* rfc9368#section-4:
+		 *
+		 * When the server then processes the client's Version
+		 * Information, the server MUST validate that the client's
+		 * Chosen Version matches the version in use for the connection.
+		 */
+		if (chosen != version)
+			return err;
+		/* Server prefers preferred version over chosen. */
+		if (pref_found)
+			best = preferred;
+		else if (ch_found)
+			best = chosen;
+	} else {
+		/* If a client receives Version Information where the server's
+		 * Chosen Version was not sent by the client as part of its
+		 * Available Versions, the client MUST close the connection with
+		 * a version negotiation error.
+		 */
+		if (!quic_packet_version_compatible(version, chosen))
+			return err;
+		/* Client prefers chosen version over preferred. */
+		if (ch_found)
+			best = chosen;
+		else if (pref_found)
+			best = preferred;
+		if (quic_paths(sk)->version) {
+			/* If the client reacted to a Version Negotiation
+			 * packet and the server's Available Versions field is
+			 * empty, the client MUST close the connection with a
+			 * version negotiation error.
+			 */
+			if (count < 2)
+				return err;
+			/* If the client would have selected a different
+			 * version, the client MUST close the connection with a
+			 * version negotiation error.
+			 */
+			if (best != chosen)
+				return err;
+		}
+	}
+
+	if (version == best)
+		return 0;
+
+	/* Change to selected best version. */
+	return quic_packet_version_change(sk, &quic_paths(sk)->orig_dcid, best);
+}
+
 /* Extracts a QUIC token from a buffer in the Client Initial packet. */
 static int quic_packet_get_token(struct quic_data *token, u8 **pp, u32 *plen)
 {

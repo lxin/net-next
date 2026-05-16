@@ -2805,3 +2805,620 @@ int quic_frame_stream_append(struct sock *sk, struct quic_frame *frame,
 
 	return msg_len;
 }
+
+/* rfc9000#section-18:
+ *
+ * Transport Parameter {
+ *   Transport Parameter ID (i),
+ *   Transport Parameter Length (i),
+ *   Transport Parameter Value (..),
+ * }
+ */
+static u8 *quic_frame_put_conn_id(u8 *p, u16 id, struct quic_conn_id *conn_id)
+{
+	p = quic_put_var(p, id);
+	p = quic_put_var(p, conn_id->len);
+	p = quic_put_data(p, conn_id->data, conn_id->len);
+	return p;
+}
+
+/* rfc9368#section-3:
+ *
+ * Version Information {
+ *   Chosen Version (32),
+ *   Available Versions (32) ...,
+ * }
+ */
+static u8 *quic_frame_put_version_info(u8 *p, u16 id, u32 version)
+{
+	u32 *versions, i, len = QUIC_VERSION_LEN;
+
+	versions = quic_packet_compatible_versions(version);
+	if (!versions)
+		return p;
+
+	for (i = 1; versions[i]; i++)
+		len += QUIC_VERSION_LEN;
+	p = quic_put_var(p, id);
+	p = quic_put_var(p, len);
+	p = quic_put_int(p, version, QUIC_VERSION_LEN);
+
+	for (i = 1; versions[i]; i++)
+		p = quic_put_int(p, versions[i], QUIC_VERSION_LEN);
+
+	return p;
+}
+
+/* rfc9000#section-18.2:
+ *
+ * Preferred Address {
+ *   IPv4 Address (32),
+ *   IPv4 Port (16),
+ *   IPv6 Address (128),
+ *   IPv6 Port (16),
+ *   Connection ID Length (8),
+ *   Connection ID (..),
+ *   Stateless Reset Token (128),
+ * }
+ */
+static u8 *quic_frame_put_address(u8 *p, u16 id, union quic_addr *addr,
+				  struct quic_conn_id *conn_id, u8 *token,
+				  struct sock *sk)
+{
+	p = quic_put_var(p, id);
+	p = quic_put_var(p, QUIC_PREF_ADDR_LEN + 1 + conn_id->len +
+			    QUIC_CONN_ID_TOKEN_LEN);
+	quic_set_pref_addr(sk, p, addr);
+	p += QUIC_PREF_ADDR_LEN;
+
+	p = quic_put_int(p, conn_id->len, 1);
+	p = quic_put_data(p, conn_id->data, conn_id->len);
+	p = quic_put_data(p, token, QUIC_CONN_ID_TOKEN_LEN);
+	return p;
+}
+
+static inline u64 quic_usec_to_msec(u32 usec)
+{
+	return DIV_ROUND_UP(usec, 1000);
+}
+
+static inline u64 quic_msec_to_usec(u64 msec)
+{
+	return msec > U32_MAX / 1000 ? U32_MAX : msec * 1000;
+}
+
+/* Construct full encoded transport parameters extension for QUIC connection. */
+int quic_frame_build_transport_params_ext(struct sock *sk,
+					  struct quic_transport_param *params,
+					  u8 *data, u32 *len)
+{
+	struct quic_conn_id_set *id_set = quic_source(sk);
+	struct quic_conn_id *active, *scid, conn_id = {};
+	struct quic_path_group *paths = quic_paths(sk);
+	u8 *p = data, token[QUIC_CONN_ID_TOKEN_LEN];
+	u32 tlen = QUIC_CONN_ID_TOKEN_LEN;
+	bool is_serv = quic_is_serv(sk);
+	struct quic_crypto *crypto;
+	u16 param_id;
+	int err;
+
+	active = quic_conn_id_active(id_set);
+	if (!is_serv)
+		goto out;
+
+	crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	/* rfc9000#section-10.3:
+	 *
+	 * A server includes the Destination Connection ID field from the first
+	 * Initial packet it received from the client in the
+	 * original_destination_connection_id transport parameter; if the
+	 * server sent a Retry packet, this refers to the first Initial packet
+	 * received before sending the Retry packet.
+	 */
+	param_id = QUIC_TRANSPORT_PARAM_ORIGINAL_DESTINATION_CONNECTION_ID;
+	p = quic_frame_put_conn_id(p, param_id, &paths->orig_dcid);
+	if (params->stateless_reset) {
+		/* rfc9000#section-10.3:
+		 *
+		 * Servers can also issue a stateless_reset_token transport
+		 * parameter during the handshake that applies to the
+		 * connection ID that it selected during the handshake.
+		 */
+		p = quic_put_var(p, QUIC_TRANSPORT_PARAM_STATELESS_RESET_TOKEN);
+		p = quic_put_var(p, tlen);
+		err = quic_crypto_derive_secret(crypto, active->data,
+						active->len, "stateless_reset",
+						token, tlen);
+		if (err)
+			return err;
+		p = quic_put_data(p, token, tlen);
+	}
+	if (paths->retry) {
+		/* rfc9000#section-10.3:
+		 *
+		 * If it sends a Retry packet, a server also includes the Source
+		 * Connection ID field from the Retry packet in the
+		 * retry_source_connection_id transport parameter.
+		 */
+		param_id = QUIC_TRANSPORT_PARAM_RETRY_SOURCE_CONNECTION_ID;
+		p = quic_frame_put_conn_id(p, param_id, &paths->retry_dcid);
+	}
+	if (paths->pref_addr) {
+		/* Write preferred address parameter with an associated conn ID
+		 * and stateless reset token.
+		 */
+		scid = quic_conn_id_find(id_set, 1);
+		if (!scid) {
+			quic_conn_id_generate(&conn_id);
+			err = quic_conn_id_add(id_set, &conn_id, 1, sk,
+					       GFP_KERNEL);
+			if (err)
+				return err;
+			scid = &conn_id;
+		}
+		err = quic_crypto_derive_secret(crypto, scid->data, scid->len,
+						"stateless_reset", token, tlen);
+		if (err)
+			return err;
+		param_id = QUIC_TRANSPORT_PARAM_PREFERRED_ADDRESS;
+		p = quic_frame_put_address(p, param_id,
+					   quic_path_saddr(paths, 1), scid,
+					   token, sk);
+	}
+
+out:
+	/* rfc9000#section-10.3:
+	 *
+	 * Each endpoint includes the value of the Source Connection ID field
+	 * from the first Initial packet it sent in the
+	 * initial_source_connection_id transport parameter.
+	 */
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_SOURCE_CONNECTION_ID;
+	p = quic_frame_put_conn_id(p, param_id, active);
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL;
+	if (params->max_stream_data_bidi_local)
+		p = quic_put_param(p, param_id,
+				   params->max_stream_data_bidi_local);
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE;
+	if (params->max_stream_data_bidi_remote)
+		p = quic_put_param(p, param_id,
+				   params->max_stream_data_bidi_remote);
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_UNI;
+	if (params->max_stream_data_uni)
+		p = quic_put_param(p, param_id, params->max_stream_data_uni);
+	if (params->max_data)
+		p = quic_put_param(p, QUIC_TRANSPORT_PARAM_INITIAL_MAX_DATA,
+				   params->max_data);
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAMS_BIDI;
+	if (params->max_streams_bidi)
+		p = quic_put_param(p, param_id, params->max_streams_bidi);
+	param_id = QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAMS_UNI;
+	if (params->max_streams_uni)
+		p = quic_put_param(p, param_id, params->max_streams_uni);
+	if (params->max_udp_payload_size != QUIC_MAX_UDP_PAYLOAD)
+		p = quic_put_param(p, QUIC_TRANSPORT_PARAM_MAX_UDP_PAYLOAD_SIZE,
+				   params->max_udp_payload_size);
+	if (params->ack_delay_exponent != QUIC_DEF_ACK_DELAY_EXPONENT)
+		p = quic_put_param(p, QUIC_TRANSPORT_PARAM_ACK_DELAY_EXPONENT,
+				   params->ack_delay_exponent);
+	param_id = QUIC_TRANSPORT_PARAM_DISABLE_ACTIVE_MIGRATION;
+	if (params->disable_active_migration) {
+		p = quic_put_var(p, param_id);
+		p = quic_put_var(p, 0);
+	}
+	param_id = QUIC_TRANSPORT_PARAM_DISABLE_1RTT_ENCRYPTION;
+	if (params->disable_1rtt_encryption) {
+		p = quic_put_var(p, param_id);
+		p = quic_put_var(p, 0);
+	}
+	param_id = QUIC_TRANSPORT_PARAM_VERSION_INFORMATION;
+	if (!params->disable_compatible_version &&
+	    (!is_serv || !quic_outq(sk)->disable_compatible_version))
+		p = quic_frame_put_version_info(p, param_id,
+						quic_packet(sk)->version);
+	if (params->grease_quic_bit) {
+		p = quic_put_var(p, QUIC_TRANSPORT_PARAM_GREASE_QUIC_BIT);
+		p = quic_put_var(p, 0);
+	}
+	if (params->max_ack_delay != QUIC_DEF_ACK_DELAY)
+		p = quic_put_param(p, QUIC_TRANSPORT_PARAM_MAX_ACK_DELAY,
+				   quic_usec_to_msec(params->max_ack_delay));
+	if (params->max_idle_timeout)
+		p = quic_put_param(p, QUIC_TRANSPORT_PARAM_MAX_IDLE_TIMEOUT,
+				   quic_usec_to_msec(params->max_idle_timeout));
+	param_id = QUIC_TRANSPORT_PARAM_ACTIVE_CONNECTION_ID_LIMIT;
+	if (params->active_connection_id_limit &&
+	    params->active_connection_id_limit != QUIC_CONN_ID_LEAST)
+		p = quic_put_param(p, param_id,
+				   params->active_connection_id_limit);
+	param_id = QUIC_TRANSPORT_PARAM_MAX_DATAGRAM_FRAME_SIZE;
+	if (params->max_datagram_frame_size)
+		p = quic_put_param(p, param_id,
+				   params->max_datagram_frame_size);
+	*len = p - data;
+	return 0;
+}
+
+/* Parse a QUIC Connection ID transport parameter. */
+static int quic_frame_get_conn_id(struct quic_conn_id *conn_id, u8 **pp,
+				  u32 *plen)
+{
+	u64 valuelen;
+
+	if (!quic_get_var(pp, plen, &valuelen))
+		return -EINVAL;
+
+	if ((u64)*plen < valuelen || valuelen > QUIC_CONN_ID_MAX_LEN)
+		return -EINVAL;
+
+	memcpy(conn_id->data, *pp, valuelen);
+	conn_id->len = (u8)valuelen;
+
+	*pp += valuelen;
+	*plen -= valuelen;
+	return 0;
+}
+
+#define QUIC_MAX_VERSIONS	16
+
+/* Parse QUIC version information transport parameter. */
+static int quic_frame_get_version_info(u32 *versions, u8 *count, u8 **pp,
+				       u32 *plen, bool is_serv)
+{
+	u64 valuelen, v = 0;
+	u8 i, found = 0;
+
+	if (!quic_get_var(pp, plen, &valuelen) || !valuelen ||
+	    (u64)*plen < valuelen)
+		return -EINVAL;
+
+	if (valuelen % QUIC_VERSION_LEN ||
+	    valuelen > QUIC_VERSION_LEN * QUIC_MAX_VERSIONS)
+		return -EINVAL;
+
+	*count = (u8)(valuelen / QUIC_VERSION_LEN);
+	if (!*count)
+		return -EINVAL;
+	for (i = 0; i < *count; i++) {
+		quic_get_int(pp, plen, &v, QUIC_VERSION_LEN);
+		if (!v)
+			return -EINVAL;
+		if (i > 0 && versions[0] == v)
+			found = 1;
+		versions[i] = v;
+	}
+	/* rfc9368#section-4:
+	 *
+	 * If a server receives Version Information where the Chosen Version is
+	 * not included in Available Versions, it MUST treat it as a parsing
+	 * failure.
+	 */
+	if (is_serv && !found)
+		return -EINVAL;
+	return 0;
+}
+
+/* Parse Preferred Address transport parameter. */
+static int quic_frame_get_address(union quic_addr *addr,
+				  struct quic_conn_id *conn_id, u8 *token,
+				  u8 **pp, u32 *plen, struct sock *sk)
+{
+	u64 valuelen, len;
+
+	if (!quic_get_var(pp, plen, &valuelen))
+		return -EINVAL;
+
+	if ((u64)*plen < valuelen || valuelen < QUIC_PREF_ADDR_LEN + 1)
+		return -EINVAL;
+
+	quic_get_pref_addr(sk, addr, pp, plen);
+
+	if (!quic_get_int(pp, plen, &len, 1) ||
+	    !len || len > QUIC_CONN_ID_MAX_LEN)
+		return -EINVAL;
+	if (valuelen != QUIC_PREF_ADDR_LEN + 1 + len + QUIC_CONN_ID_TOKEN_LEN)
+		return -EINVAL;
+
+	conn_id->len = len;
+	if (!quic_get_data(pp, plen, conn_id->data, conn_id->len))
+		return -EINVAL;
+	if (!quic_get_data(pp, plen, token, QUIC_CONN_ID_TOKEN_LEN))
+		return -EINVAL;
+	return 0;
+}
+
+enum {
+	QUIC_TRANSPORT_PARAM_IDX_MAX_DATAGRAM_FRAME_SIZE =
+					QUIC_TRANSPORT_PARAM_MAX + 1,
+	QUIC_TRANSPORT_PARAM_IDX_GREASE_QUIC_BIT,
+	QUIC_TRANSPORT_PARAM_IDX_DISABLE_1RTT_ENCRYPTION,
+	QUIC_TRANSPORT_PARAM_IDX_MAX,
+};
+
+static u32 quic_frame_param_idx(u64 param)
+{
+	if (param <= QUIC_TRANSPORT_PARAM_MAX)
+		return param;
+
+	if (param == QUIC_TRANSPORT_PARAM_MAX_DATAGRAM_FRAME_SIZE)
+		return QUIC_TRANSPORT_PARAM_IDX_MAX_DATAGRAM_FRAME_SIZE;
+	if (param == QUIC_TRANSPORT_PARAM_GREASE_QUIC_BIT)
+		return QUIC_TRANSPORT_PARAM_IDX_GREASE_QUIC_BIT;
+	if (param == QUIC_TRANSPORT_PARAM_DISABLE_1RTT_ENCRYPTION)
+		return QUIC_TRANSPORT_PARAM_IDX_DISABLE_1RTT_ENCRYPTION;
+
+	return QUIC_TRANSPORT_PARAM_IDX_MAX;
+}
+
+/* Parse full encoded transport parameters extension for QUIC connection. */
+int quic_frame_parse_transport_params_ext(struct sock *sk,
+					  struct quic_transport_param *params,
+					  u8 *data, u32 len)
+{
+	u8 *p = data, count, token[QUIC_CONN_ID_TOKEN_LEN];
+	u8 param_seen[QUIC_TRANSPORT_PARAM_IDX_MAX] = {};
+	struct quic_conn_id_set *id_set = quic_dest(sk);
+	struct quic_path_group *paths = quic_paths(sk);
+	u32 idx, versions[QUIC_MAX_VERSIONS] = {};
+	struct quic_conn_id *active, conn_id = {};
+	bool is_serv = quic_is_serv(sk);
+	u64 type, value, valuelen;
+	union quic_addr addr;
+	int err;
+
+	/* Apply default values if the peer omits these transport parameters. */
+	params->max_udp_payload_size = QUIC_MAX_UDP_PAYLOAD;
+	params->ack_delay_exponent = QUIC_DEF_ACK_DELAY_EXPONENT;
+	params->max_ack_delay = QUIC_DEF_ACK_DELAY;
+	params->active_connection_id_limit = QUIC_CONN_ID_LEAST;
+	params->disable_compatible_version = 1;
+
+	active = quic_conn_id_active(id_set);
+	while (len > 0) {
+		if (!quic_get_var(&p, &len, &type))
+			return -EINVAL;
+
+		/* rfc9000#section-7.4:
+		 *
+		 * An endpoint MUST NOT send a parameter more than once in a
+		 * given transport parameters extension. An endpoint SHOULD
+		 * treat receipt of duplicate transport parameters as a
+		 * connection error of type TRANSPORT_PARAMETER_ERROR.
+		 */
+		idx = quic_frame_param_idx(type);
+		if (idx != QUIC_TRANSPORT_PARAM_IDX_MAX) {
+			if (param_seen[idx])
+				return -EINVAL;
+			param_seen[idx] = 1;
+		}
+
+		switch (type) {
+		case QUIC_TRANSPORT_PARAM_ORIGINAL_DESTINATION_CONNECTION_ID:
+			if (is_serv)
+				return -EINVAL;
+			err = quic_frame_get_conn_id(&conn_id, &p, &len);
+			if (err)
+				return err;
+			/* Validate original_destination_connection_id sent by
+			 * the server.
+			 */
+			if (quic_conn_id_cmp(&paths->orig_dcid, &conn_id))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_RETRY_SOURCE_CONNECTION_ID:
+			if (is_serv || !paths->retry)
+				return -EINVAL;
+			err = quic_frame_get_conn_id(&conn_id, &p, &len);
+			if (err)
+				return err;
+			/* Validate retry_source_connection_id sent by the
+			 * server.
+			 */
+			if (quic_conn_id_cmp(&paths->retry_dcid, &conn_id))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_SOURCE_CONNECTION_ID:
+			err = quic_frame_get_conn_id(&conn_id, &p, &len);
+			if (err)
+				return err;
+			/* Validate initial_source_connection_id sent by the
+			 * peer.
+			 */
+			if (quic_conn_id_cmp(active, &conn_id))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL:
+			if (!quic_get_param(&params->max_stream_data_bidi_local,
+					    &p, &len))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			params->max_stream_data_bidi_remote = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAM_DATA_UNI:
+			if (!quic_get_param(&params->max_stream_data_uni, &p,
+					    &len))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_DATA:
+			if (!quic_get_param(&params->max_data, &p, &len))
+				return -EINVAL;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAMS_BIDI:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			/* Limit the number of bidirectional streams to avoid
+			 * exhausting system memory.
+			 */
+			if (value > QUIC_MAX_STREAMS)
+				value = QUIC_MAX_STREAMS;
+			params->max_streams_bidi = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_INITIAL_MAX_STREAMS_UNI:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			/* Limit the number of unidirectional streams to avoid
+			 * exhausting system memory.
+			 */
+			if (value > QUIC_MAX_STREAMS)
+				value = QUIC_MAX_STREAMS;
+			params->max_streams_uni = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_MAX_IDLE_TIMEOUT:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			value = quic_msec_to_usec(value);
+			if (value && value < QUIC_MIN_IDLE_TIMEOUT)
+				return -EINVAL;
+			params->max_idle_timeout = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_MAX_UDP_PAYLOAD_SIZE:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			if (value < QUIC_MIN_UDP_PAYLOAD ||
+			    value > QUIC_MAX_UDP_PAYLOAD)
+				return -EINVAL;
+			params->max_udp_payload_size = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_ACK_DELAY_EXPONENT:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			if (value > QUIC_MAX_ACK_DELAY_EXPONENT)
+				return -EINVAL;
+			params->ack_delay_exponent = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_DISABLE_ACTIVE_MIGRATION:
+			if (!quic_get_var(&p, &len, &valuelen))
+				return -EINVAL;
+			if (valuelen)
+				return -EINVAL;
+			params->disable_active_migration = 1;
+			break;
+		case QUIC_TRANSPORT_PARAM_DISABLE_1RTT_ENCRYPTION:
+			if (!quic_get_var(&p, &len, &valuelen) ||
+			    (u64)len < valuelen)
+				return -EINVAL;
+			if (!is_serv && valuelen)
+				return -EINVAL;
+			params->disable_1rtt_encryption = 1;
+			len -= valuelen;
+			p += valuelen;
+			break;
+		case QUIC_TRANSPORT_PARAM_GREASE_QUIC_BIT:
+			if (!quic_get_var(&p, &len, &valuelen))
+				return -EINVAL;
+			if (valuelen)
+				return -EINVAL;
+			params->grease_quic_bit = 1;
+			break;
+		case QUIC_TRANSPORT_PARAM_MAX_ACK_DELAY:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			value = quic_msec_to_usec(value);
+			if (value >= QUIC_MAX_ACK_DELAY)
+				return -EINVAL;
+			params->max_ack_delay = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_ACTIVE_CONNECTION_ID_LIMIT:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			if (value < QUIC_CONN_ID_LEAST ||
+			    value > QUIC_CONN_ID_LIMIT)
+				return -EINVAL;
+			params->active_connection_id_limit = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_MAX_DATAGRAM_FRAME_SIZE:
+			if (!quic_get_param(&value, &p, &len))
+				return -EINVAL;
+			if (value) {
+				if (value < QUIC_PATH_MIN_PMTU)
+					return -EINVAL;
+				if (value > QUIC_PATH_MAX_PMTU)
+					value = QUIC_PATH_MAX_PMTU;
+			}
+			params->max_datagram_frame_size = value;
+			break;
+		case QUIC_TRANSPORT_PARAM_STATELESS_RESET_TOKEN:
+			if (is_serv)
+				return -EINVAL;
+			if (!quic_get_var(&p, &len, &valuelen) ||
+			    (u64)len < valuelen ||
+			    valuelen != QUIC_CONN_ID_TOKEN_LEN)
+				return -EINVAL;
+			quic_conn_id_set_token(active, p);
+			params->stateless_reset = 1;
+			len -= valuelen;
+			p += valuelen;
+			break;
+		case QUIC_TRANSPORT_PARAM_VERSION_INFORMATION:
+			err = quic_frame_get_version_info(versions, &count, &p,
+							  &len, is_serv);
+			if (err)
+				return err;
+			err = quic_packet_select_version(sk, versions, count);
+			if (err)
+				return err;
+			params->disable_compatible_version = 0;
+			break;
+		case QUIC_TRANSPORT_PARAM_PREFERRED_ADDRESS:
+			if (is_serv)
+				return -EINVAL;
+			err = quic_frame_get_address(&addr, &conn_id, token, &p,
+						     &len, sk);
+			if (err)
+				return err;
+			err = quic_conn_id_add(id_set, &conn_id, 1, token,
+					       GFP_KERNEL);
+			if (err)
+				return err;
+			/* Mark and set preferred address if it's valid and
+			 * differs from the original.
+			 */
+			if (addr.v4.sin_port &&
+			    !quic_cmp_sk_addr(sk, quic_path_daddr(paths, 0),
+					      &addr)) {
+				paths->pref_addr = 1;
+				quic_path_set_daddr(paths, 1, &addr);
+			}
+			break;
+		default:
+			/* Ignore unknown parameter. */
+			if (!quic_get_var(&p, &len, &valuelen) ||
+			    (u64)len < valuelen)
+				return -EINVAL;
+			len -= valuelen;
+			p += valuelen;
+			break;
+		}
+	}
+
+	/* rfc9000#section-7.3:
+	 *
+	 * An endpoint MUST treat the absence of the
+	 * initial_source_connection_id transport parameter from either
+	 * endpoint or the absence of the original_destination_connection_id
+	 * transport parameter from the server as a connection error of type
+	 * TRANSPORT_PARAMETER_ERROR.
+	 *
+	 * An endpoint MUST treat absence of the retry_source_connection_id
+	 * transport parameter from the server after receiving a Retry packet,
+	 * as a connection error of type TRANSPORT_PARAMETER_ERROR or
+	 * PROTOCOL_VIOLATION.
+	 */
+	type = QUIC_TRANSPORT_PARAM_INITIAL_SOURCE_CONNECTION_ID;
+	if (!param_seen[quic_frame_param_idx(type)])
+		return -EINVAL;
+	if (!is_serv) {
+		if (paths->retry) {
+			type = QUIC_TRANSPORT_PARAM_RETRY_SOURCE_CONNECTION_ID;
+			if (!param_seen[quic_frame_param_idx(type)])
+				return -EINVAL;
+		}
+		type = QUIC_TRANSPORT_PARAM_ORIGINAL_DESTINATION_CONNECTION_ID;
+		if (!param_seen[quic_frame_param_idx(type)])
+			return -EINVAL;
+	}
+	return 0;
+}

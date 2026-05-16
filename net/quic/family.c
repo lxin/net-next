@@ -331,6 +331,87 @@ static int quic_v6_get_user_addr(struct sock *sk, union quic_addr *a,
 	return 0;
 }
 
+static void quic_v4_get_pref_addr(struct sock *sk, union quic_addr *addr,
+				  u8 **pp, u32 *plen)
+{
+	u8 *p = *pp;
+
+	memcpy(&addr->v4.sin_addr, p, QUIC_ADDR4_LEN);
+	p += QUIC_ADDR4_LEN;
+	memcpy(&addr->v4.sin_port, p, QUIC_PORT_LEN);
+	p += QUIC_PORT_LEN;
+	addr->v4.sin_family = AF_INET;
+	/* Skip over IPv6 address and port, not used for AF_INET sockets. */
+	p += QUIC_ADDR6_LEN;
+	p += QUIC_PORT_LEN;
+
+	if (!addr->v4.sin_port || quic_v4_is_any_addr(addr) ||
+	    ipv4_is_multicast(addr->v4.sin_addr.s_addr))
+		memset(addr, 0, sizeof(*addr));
+	*plen -= (p - *pp);
+	*pp = p;
+}
+
+static void quic_v6_get_pref_addr(struct sock *sk, union quic_addr *addr,
+				  u8 **pp, u32 *plen)
+{
+	struct dst_entry *dst;
+	u8 *p = *pp;
+	int type;
+
+	/* Skip over IPv4 address and port. */
+	p += QUIC_ADDR4_LEN;
+	p += QUIC_PORT_LEN;
+	/* Try to use IPv6 address and port first. */
+	memcpy(&addr->v6.sin6_addr, p, QUIC_ADDR6_LEN);
+	p += QUIC_ADDR6_LEN;
+	memcpy(&addr->v6.sin6_port, p, QUIC_PORT_LEN);
+	p += QUIC_PORT_LEN;
+	addr->v6.sin6_family = AF_INET6;
+
+	type = ipv6_addr_type(&addr->v6.sin6_addr);
+	if (!addr->v6.sin6_port || !(type & IPV6_ADDR_UNICAST)) {
+		memset(addr, 0, sizeof(*addr));
+		if (ipv6_only_sock(sk))
+			goto out;
+		/* Fallback to IPv4 if IPv6 address is not usable. */
+		return quic_v4_get_pref_addr(sk, addr, pp, plen);
+	}
+	if (type & IPV6_ADDR_LINKLOCAL) {
+		dst = __sk_dst_get(sk);
+		if (dst)
+			addr->v6.sin6_scope_id = dst->dev->ifindex;
+	}
+out:
+	*plen -= (p - *pp);
+	*pp = p;
+}
+
+static void quic_v4_set_pref_addr(struct sock *sk, u8 *p, union quic_addr *addr)
+{
+	memcpy(p, &addr->v4.sin_addr, QUIC_ADDR4_LEN);
+	p += QUIC_ADDR4_LEN;
+	memcpy(p, &addr->v4.sin_port, QUIC_PORT_LEN);
+	p += QUIC_PORT_LEN;
+	memset(p, 0, QUIC_ADDR6_LEN);
+	p += QUIC_ADDR6_LEN;
+	memset(p, 0, QUIC_PORT_LEN);
+}
+
+static void quic_v6_set_pref_addr(struct sock *sk, u8 *p, union quic_addr *addr)
+{
+	if (addr->sa.sa_family == AF_INET)
+		return quic_v4_set_pref_addr(sk, p, addr);
+
+	memset(p, 0, QUIC_ADDR4_LEN);
+	p += QUIC_ADDR4_LEN;
+	memset(p, 0, QUIC_PORT_LEN);
+	p += QUIC_PORT_LEN;
+	memcpy(p, &addr->v6.sin6_addr, QUIC_ADDR6_LEN);
+	p += QUIC_ADDR6_LEN;
+	memcpy(p, &addr->v6.sin6_port, QUIC_PORT_LEN);
+}
+
 static bool quic_v4_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 				union quic_addr *addr)
 {
@@ -520,6 +601,20 @@ int quic_get_user_addr(struct sock *sk, union quic_addr *a,
 	return quic_pf_ipv4(sk) ?
 	       quic_v4_get_user_addr(sk, a, addr, addr_len, any) :
 	       quic_v6_get_user_addr(sk, a, addr, addr_len, any);
+}
+
+void quic_get_pref_addr(struct sock *sk, union quic_addr *addr, u8 **pp,
+			u32 *plen)
+{
+	memset(addr, 0, sizeof(*addr));
+	quic_pf_ipv4(sk) ? quic_v4_get_pref_addr(sk, addr, pp, plen) :
+			   quic_v6_get_pref_addr(sk, addr, pp, plen);
+}
+
+void quic_set_pref_addr(struct sock *sk, u8 *p, union quic_addr *addr)
+{
+	quic_pf_ipv4(sk) ? quic_v4_set_pref_addr(sk, p, addr) :
+			   quic_v6_set_pref_addr(sk, p, addr);
 }
 
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
