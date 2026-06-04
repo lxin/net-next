@@ -4558,6 +4558,183 @@ static int sctp_setsockopt_probe_interval(struct sock *sk,
 	return 0;
 }
 
+static int sctp_setsockopt_set_send_keys(struct sock *sk,
+					 struct sctp_dtls_keys *params,
+					 unsigned int optlen)
+{
+	struct sctp_association *asoc;
+	struct sctp_endpoint *ep;
+	int err;
+
+	if (sctp_sstate(sk, LISTENING))
+		return -EINVAL;
+	if (optlen < sizeof(*params))
+		return -EINVAL;
+	optlen -= sizeof(*params);
+	if (optlen < params->sdk_key_len + params->sdk_iv_len +
+		     params->sdk_sn_key_len)
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, params->sdk_assoc_id);
+	if (!asoc && params->sdk_assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	if (asoc) {
+		if (sctp_state(asoc, COOKIE_WAIT) ||
+		    sctp_state(asoc, COOKIE_ECHOED))
+			return -EINVAL;
+
+		err = sctp_dtls_set_send_keys(&asoc->dtls, params);
+		if (err)
+			return err;
+
+		sctp_assoc_update_frag_point(asoc);
+		return 0;
+	}
+
+	ep = sctp_sk(sk)->ep;
+	if (!params->sdk_restart)
+		return -EINVAL;
+
+	return sctp_dtls_set_send_keys(&ep->dtls, params);
+}
+
+static int sctp_setsockopt_add_recv_keys(struct sock *sk,
+					 struct sctp_dtls_keys *params,
+					 unsigned int optlen)
+{
+	struct sctp_association *asoc;
+	struct sctp_endpoint *ep;
+
+	if (sctp_sstate(sk, LISTENING))
+		return -EINVAL;
+	if (optlen < sizeof(*params))
+		return -EINVAL;
+	if (optlen < params->sdk_key_len + params->sdk_iv_len +
+		     params->sdk_sn_key_len)
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, params->sdk_assoc_id);
+	if (!asoc && params->sdk_assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	if (asoc) {
+		if (sctp_state(asoc, COOKIE_WAIT) ||
+		    sctp_state(asoc, COOKIE_ECHOED))
+			return -EINVAL;
+
+		return sctp_dtls_add_recv_keys(&asoc->dtls, params);
+	}
+
+	ep = sctp_sk(sk)->ep;
+	if (!params->sdk_restart)
+		return -EINVAL;
+
+	return sctp_dtls_add_recv_keys(&ep->dtls, params);
+}
+
+static int sctp_setsockopt_del_recv_keys(struct sock *sk,
+					 struct sctp_dtls_keys_id *params,
+					 unsigned int optlen)
+{
+	struct sctp_association *asoc;
+	struct sctp_endpoint *ep;
+
+	if (sctp_sstate(sk, CLOSED))
+		return -EINVAL;
+	if (optlen < sizeof(*params))
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, params->sdki_assoc_id);
+	if (!asoc && params->sdki_assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	if (asoc) {
+		if (sctp_state(asoc, COOKIE_WAIT) ||
+		    sctp_state(asoc, COOKIE_ECHOED))
+			return -EINVAL;
+
+		return sctp_dtls_del_recv_keys(&asoc->dtls, params);
+	}
+
+	ep = sctp_sk(sk)->ep;
+	if (!params->sdki_restart)
+		return -EINVAL;
+
+	return sctp_dtls_del_recv_keys(&ep->dtls, params);
+}
+
+static int sctp_setsockopt_local_config(struct sock *sk,
+					struct sctp_dtls_config *params,
+					unsigned int optlen)
+{
+	struct sctp_endpoint *ep = sctp_sk(sk)->ep;
+	int err;
+
+	if (!sctp_sstate(sk, CLOSED))
+		return -EINVAL;
+
+	if (optlen < sizeof(*params) + params->sdc_nr_pmids)
+		return -EINVAL;
+
+	optlen = params->sdc_nr_pmids;
+	if (params->sdc_assoc_id != SCTP_FUTURE_ASSOC)
+		return -EINVAL;
+
+	err = sctp_kmp_set(&ep->dtls.local_kmp, params->sdc_flags,
+			   params->sdc_pmids, optlen, GFP_KERNEL);
+	if (err)
+		return err;
+
+	ep->dtls.strict = !!(params->sdc_flags & SCTP_DTLS_REQUIRED);
+	return 0;
+}
+
+static int sctp_setsockopt_enforce_protection(struct sock *sk,
+					      struct sctp_assoc_value *params,
+					      unsigned int optlen)
+{
+	struct sctp_association *asoc;
+
+	if (optlen < sizeof(*params))
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, params->assoc_id);
+	if (!asoc)
+		return -EINVAL;
+
+	if (sctp_state(asoc, COOKIE_WAIT) || sctp_state(asoc, COOKIE_ECHOED))
+		return -EINVAL;
+
+	asoc->dtls.force_crypto = params->assoc_value;
+	return 0;
+}
+
+static int sctp_setsockopt_replay_window(struct sock *sk,
+					 struct sctp_assoc_value *params,
+					 unsigned int optlen)
+{
+	struct sctp_endpoint *ep = sctp_sk(sk)->ep;
+	struct sctp_association *asoc;
+
+	if (optlen < sizeof(*params))
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, params->assoc_id);
+	if (!asoc && params->assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	if (asoc)
+		asoc->dtls.replay_window = params->assoc_value;
+	else
+		ep->dtls.replay_window = params->assoc_value;
+	return 0;
+}
+
 /* API 6.2 setsockopt(), getsockopt()
  *
  * Applications use setsockopt() and getsockopt() to set or retrieve
@@ -4786,6 +4963,24 @@ static int sctp_setsockopt(struct sock *sk, int level, int optname,
 		break;
 	case SCTP_PLPMTUD_PROBE_INTERVAL:
 		retval = sctp_setsockopt_probe_interval(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_SET_SEND_KEYS:
+		retval = sctp_setsockopt_set_send_keys(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_ADD_RECV_KEYS:
+		retval = sctp_setsockopt_add_recv_keys(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_DEL_RECV_KEYS:
+		retval = sctp_setsockopt_del_recv_keys(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_LOCAL_CONFIG:
+		retval = sctp_setsockopt_local_config(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_ENFORCE_PROTECTION:
+		retval = sctp_setsockopt_enforce_protection(sk, kopt, optlen);
+		break;
+	case SCTP_DTLS_REPLAY_WINDOW:
+		retval = sctp_setsockopt_replay_window(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;
@@ -8114,6 +8309,348 @@ out:
 	return 0;
 }
 
+static int sctp_getsockopt_local_config(struct sock *sk, int len,
+					char __user *optval, int __user *optlen)
+{
+	__u8 buf[sizeof(struct sctp_dtls_config) + SCTP_MAX_PMIDS_LEN] = {};
+	struct sctp_endpoint *ep = sctp_sk(sk)->ep;
+	struct sctp_dtls_config *params;
+	struct sctp_association *asoc;
+	struct sctp_kmp kmp;
+
+	params = (struct sctp_dtls_config *)buf;
+	if (len <= sizeof(*params))
+		return -EINVAL;
+
+	if (copy_from_user(params, optval, sizeof(*params)))
+		return -EFAULT;
+
+	if (!asoc && params->sdc_assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	kmp = asoc ? asoc->dtls.local_kmp : ep->dtls.local_kmp;
+	if (!kmp.len) {
+		len = sizeof(*params);
+		goto out;
+	}
+
+	kmp.len -= SCTP_DTLS_TIEB_LEN;
+	kmp.data += SCTP_DTLS_TIEB_LEN;
+
+	params->sdc_flags = *kmp.data;
+	if (ep->dtls.strict)
+		params->sdc_flags |= SCTP_DTLS_REQUIRED;
+	kmp.len -= SCTP_DTLS_FLAGS_LEN;
+	kmp.data += SCTP_DTLS_FLAGS_LEN;
+
+	if (len < sizeof(*params) + kmp.len)
+		return -EINVAL;
+	len = sizeof(*params) + kmp.len;
+
+	params->sdc_nr_pmids = kmp.len;
+	memcpy(params->sdc_pmids, kmp.data, kmp.len);
+
+out:
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sctp_getsockopt_get_config(struct sock *sk, int len,
+				      char __user *optval, int __user *optlen)
+{
+	__u8 buf[sizeof(struct sctp_dtls_config) + sizeof(__u16)];
+	struct sctp_dtls_config *params;
+	struct sctp_association *asoc;
+	struct sctp_kmp kmp;
+
+	params = (struct sctp_dtls_config *)buf;
+	if (len <= sizeof(*params))
+		return -EINVAL;
+
+	if (copy_from_user(params, optval, sizeof(*params)))
+		return -EFAULT;
+
+	asoc = sctp_id2assoc(sk, params->sdc_assoc_id);
+	if (!asoc)
+		return -EINVAL;
+
+	if (sctp_state(asoc, COOKIE_WAIT) || sctp_state(asoc, COOKIE_ECHOED))
+		return -EINVAL;
+
+	kmp = asoc->dtls.chosen_kmp;
+	if (!kmp.len) {
+		len = sizeof(*params);
+		goto out;
+	}
+
+	kmp.len -= SCTP_DTLS_TIEB_LEN;
+	kmp.data += SCTP_DTLS_TIEB_LEN;
+
+	params->sdc_flags = *kmp.data;
+	kmp.len -= SCTP_DTLS_FLAGS_LEN;
+	kmp.data += SCTP_DTLS_FLAGS_LEN;
+
+	if (len < sizeof(*params) + kmp.len)
+		return -EINVAL;
+	len = sizeof(*params) + kmp.len;
+
+	params->sdc_nr_pmids = kmp.len;
+	memcpy(params->sdc_pmids, kmp.data, kmp.len);
+
+out:
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sctp_getsockopt_get_kvparam(struct sock *sk, int len,
+				       char __user *optval, int __user *optlen,
+				       bool local)
+{
+	__u8 buf[sizeof(struct sctp_dtls_kmp) + sizeof(struct sctp_km_param) +
+		 SCTP_DTLS_PMID_OFF + SCTP_MAX_PMIDS_LEN];
+	struct sctp_dtls_kmp *params = (struct sctp_dtls_kmp *)buf;
+	struct sctp_km_param *km_param;
+	struct sctp_association *asoc;
+	struct sctp_kmp *kmp;
+
+	if (len <= sizeof(*params))
+		return -EINVAL;
+
+	if (copy_from_user(params, optval, sizeof(*params)))
+		return -EFAULT;
+
+	asoc = sctp_id2assoc(sk, params->sdk_assoc_id);
+	if (!asoc)
+		return -EINVAL;
+
+	if (sctp_state(asoc, COOKIE_WAIT) || sctp_state(asoc, COOKIE_ECHOED))
+		return -EINVAL;
+
+	kmp = local ? &asoc->dtls.local_kmp : &asoc->dtls.peer_kmp;
+	if (!kmp->len) {
+		len = sizeof(*params);
+		goto out;
+	}
+
+	if (len < sizeof(*params) + sizeof(*km_param) + kmp->len)
+		return -EINVAL;
+	len = sizeof(*params) + sizeof(*km_param) + kmp->len;
+
+	params->sdk_nr_bytes = sizeof(*km_param) + kmp->len;
+	km_param = (struct sctp_km_param *)params->sdk_bytes;
+	km_param->param_hdr.type = SCTP_PARAM_DTLS_CHUNK;
+	km_param->param_hdr.length = htons(sizeof(*km_param) + kmp->len);
+	memcpy(km_param + 1, kmp->data, kmp->len);
+
+out:
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sctp_getsockopt_enforce_protection(struct sock *sk, int len,
+					      char __user *optval,
+					      int __user *optlen)
+{
+	struct sctp_assoc_value params;
+	struct sctp_association *asoc;
+
+	if (len < sizeof(params))
+		return -EINVAL;
+
+	len = sizeof(params);
+	if (copy_from_user(&params, optval, len))
+		return -EFAULT;
+
+	asoc = sctp_id2assoc(sk, params.assoc_id);
+	if (!asoc)
+		return -EINVAL;
+
+	params.assoc_value = asoc->dtls.force_crypto;
+
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, &params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sctp_getsockopt_get_stats(struct sock *sk, int len,
+				     char __user *optval, int __user *optlen)
+{
+	struct sctp_dtls_stats params;
+	struct sctp_association *asoc;
+
+	if (len < sizeof(params))
+		return -EINVAL;
+
+	len = sizeof(params);
+	if (copy_from_user(&params, optval, len))
+		return -EFAULT;
+
+	asoc = sctp_id2assoc(sk, params.sds_assoc_id);
+	if (!asoc)
+		return -EINVAL;
+
+	params.sds_dropped_unprotected = asoc->dtls.stats.dropped_unprotected;
+	params.sds_aead_failures = asoc->dtls.stats.aead_failures;
+	params.sds_recv_protected = asoc->dtls.stats.recv_protected;
+	params.sds_sent_protected = asoc->dtls.stats.sent_protected;
+
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, &params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sctp_getsockopt_replay_window(struct sock *sk, int len,
+					 char __user *optval,
+					 int __user *optlen)
+{
+	struct sctp_endpoint *ep = sctp_sk(sk)->ep;
+	struct sctp_assoc_value params;
+	struct sctp_association *asoc;
+
+	if (len < sizeof(params))
+		return -EINVAL;
+	len = sizeof(params);
+
+	if (copy_from_user(&params, optval, len))
+		return -EFAULT;
+
+	asoc = sctp_id2assoc(sk, params.assoc_id);
+	if (!asoc && params.assoc_id != SCTP_FUTURE_ASSOC &&
+	    sctp_style(sk, UDP))
+		return -EINVAL;
+
+	if (asoc)
+		params.assoc_value = asoc->dtls.replay_window;
+	else
+		params.assoc_value = ep->dtls.replay_window;
+
+	if (put_user(len, optlen))
+		return -EFAULT;
+
+	if (copy_to_user(optval, &params, len))
+		return -EFAULT;
+
+	return 0;
+}
+
+static void sctp_dlts_debug_cb(void *data, int err)
+{
+	struct sk_buff *skb = data;
+
+	if (err == -EINPROGRESS)
+		return;
+
+	if (skb->skb_iif)
+		kfree_sensitive(SCTP_INPUT_CB(skb)->crypto_ctx);
+	else
+		kfree_sensitive(SCTP_OUTPUT_CB(skb)->crypto_ctx);
+	kfree_skb(skb);
+}
+
+static int sctp_getsockopt_debug_protect(struct sock *sk, int len,
+					 char __user *optval,
+					 int __user *optlen, bool enc)
+{
+	struct sctp_association *asoc;
+	struct sk_buff *skb = NULL;
+	struct sctp_chunkhdr *ch;
+	struct sctphdr hdr = {};
+	void *data;
+	int err;
+
+	if (len > USHRT_MAX || !IS_ALIGNED(len, 4) || len <= SCTP_DTLS_OVERHEAD)
+		return -EINVAL;
+
+	asoc = sctp_id2assoc(sk, 0);
+	if (!asoc)
+		return -EINVAL;
+
+	data = memdup_sockptr(USER_SOCKPTR(optval), len);
+	if (IS_ERR(data))
+		return PTR_ERR(data);
+
+	if (enc) {
+		skb = alloc_skb(len + sizeof(hdr), GFP_KERNEL);
+		if (!skb) {
+			err = -ENOMEM;
+			goto out;
+		}
+		skb_put_data(skb, &hdr, sizeof(hdr));
+
+		ch = skb_put(skb, SCTP_DTLS_HEAD);
+		ch->type = SCTP_CID_DTLS;
+		if (!asoc->dtls.send_crypto[SCTP_CRYPTO_DATA])
+			ch->flags = SCTP_CHUNK_FLAG_R;
+		else
+			ch->flags = 0;
+
+		skb_put_data(skb, data, len - SCTP_DTLS_OVERHEAD);
+		err = sctp_dtls_encode_record(&asoc->dtls, skb,
+					      sctp_dlts_debug_cb,
+					      GFP_KERNEL, 0);
+		if (err)
+			goto out;
+		if (skb->len - sizeof(hdr) > len) {
+			err = -EMSGSIZE;
+			goto out;
+		}
+		if (put_user(skb->len - sizeof(hdr), optlen) ||
+		    copy_to_user(optval, skb->data + sizeof(hdr),
+				 skb->len - sizeof(hdr)))
+			err = -EFAULT;
+	} else {
+		skb = alloc_skb(len, GFP_KERNEL);
+		if (!skb) {
+			err = -ENOMEM;
+			goto out;
+		}
+		skb->skb_iif = 1;
+		skb_put_data(skb, data, len);
+		err = sctp_dtls_decode_record(&asoc->dtls, skb,
+					      sctp_dlts_debug_cb,
+					      GFP_KERNEL, 0);
+		if (err)
+			goto out;
+		if (skb->len > len) {
+			err = -EMSGSIZE;
+			goto out;
+		}
+		if (put_user(skb->len, optlen) ||
+		    copy_to_user(optval, skb->data, skb->len))
+			err = -EFAULT;
+	}
+
+out:
+	if (err != -EINPROGRESS)
+		kfree_skb(skb);
+	kfree(data);
+	return err;
+}
+
 static int sctp_getsockopt(struct sock *sk, int level, int optname,
 			   char __user *optval, int __user *optlen)
 {
@@ -8339,6 +8876,38 @@ static int sctp_getsockopt(struct sock *sk, int level, int optname,
 		break;
 	case SCTP_PLPMTUD_PROBE_INTERVAL:
 		retval = sctp_getsockopt_probe_interval(sk, len, optval, optlen);
+		break;
+	case SCTP_DTLS_LOCAL_CONFIG:
+		retval = sctp_getsockopt_local_config(sk, len, optval, optlen);
+		break;
+	case SCTP_DTLS_GET_CONFIG:
+		retval = sctp_getsockopt_get_config(sk, len, optval, optlen);
+		break;
+	case SCTP_DTLS_GET_LOCAL_KM_PARAM:
+		retval = sctp_getsockopt_get_kvparam(sk, len, optval, optlen,
+						     true);
+		break;
+	case SCTP_DTLS_GET_PEER_KM_PARAM:
+		retval = sctp_getsockopt_get_kvparam(sk, len, optval, optlen,
+						     false);
+		break;
+	case SCTP_DTLS_ENFORCE_PROTECTION:
+		retval = sctp_getsockopt_enforce_protection(sk, len, optval,
+							    optlen);
+		break;
+	case SCTP_DTLS_GET_STATS:
+		retval = sctp_getsockopt_get_stats(sk, len, optval, optlen);
+		break;
+	case SCTP_DTLS_REPLAY_WINDOW:
+		retval = sctp_getsockopt_replay_window(sk, len, optval, optlen);
+		break;
+	case SCTP_DTLS_DEBUG_ENCRYPT:
+		retval = sctp_getsockopt_debug_protect(sk, len, optval, optlen,
+						       true);
+		break;
+	case SCTP_DTLS_DEBUG_DECRYPT:
+		retval = sctp_getsockopt_debug_protect(sk, len, optval, optlen,
+						       false);
 		break;
 	default:
 		retval = -ENOPROTOOPT;

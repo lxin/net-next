@@ -143,6 +143,20 @@ typedef __s32 sctp_assoc_t;
 #define SCTP_REMOTE_UDP_ENCAPS_PORT	132
 #define SCTP_PLPMTUD_PROBE_INTERVAL	133
 
+#define SCTP_DTLS_SET_SEND_KEYS			134
+#define SCTP_DTLS_ADD_RECV_KEYS			135
+#define SCTP_DTLS_DEL_RECV_KEYS			136
+#define SCTP_DTLS_LOCAL_CONFIG			137
+#define SCTP_DTLS_GET_CONFIG			138
+#define SCTP_DTLS_GET_LOCAL_KM_PARAM		139
+#define SCTP_DTLS_GET_PEER_KM_PARAM		140
+#define SCTP_DTLS_ENFORCE_PROTECTION		141
+#define SCTP_DTLS_GET_STATS			142
+#define SCTP_DTLS_REPLAY_WINDOW			143
+
+#define SCTP_DTLS_DEBUG_ENCRYPT			1000
+#define SCTP_DTLS_DEBUG_DECRYPT			1001
+
 /* PR-SCTP policies */
 #define SCTP_PR_SCTP_NONE	0x0000
 #define SCTP_PR_SCTP_TTL	0x0010
@@ -1253,6 +1267,30 @@ enum {
 	SCTP_DTLS_SERVER	= 1 << 1,
 	SCTP_DTLS_RESTART	= 1 << 2,
 	SCTP_DTLS_REQUIRED	= 1 << 8,
+};
+
+/* DTLS KM config socket option */
+struct sctp_dtls_config {
+	sctp_assoc_t sdc_assoc_id;
+	__u16 sdc_nr_pmids;
+	__u16 sdc_flags;
+	__u8 sdc_pmids[];
+};
+
+/* DTLS KM param socket option */
+struct sctp_dtls_kmp {
+	sctp_assoc_t sdk_assoc_id;
+	__u32 sdk_nr_bytes;
+	__u8 sdk_bytes[];
+};
+
+/* DTLS Statistic Counters socket option */
+struct sctp_dtls_stats {
+	sctp_assoc_t sds_assoc_id;
+	__u64 sds_dropped_unprotected;
+	__u64 sds_aead_failures;
+	__u64 sds_recv_protected;
+	__u64 sds_sent_protected;
 };
 
 #endif /* _UAPI_SCTP_H */

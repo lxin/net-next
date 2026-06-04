@@ -43,6 +43,10 @@ static unsigned long max_autoclose_max =
 	(MAX_SCHEDULE_TIMEOUT / HZ > UINT_MAX)
 	? UINT_MAX : MAX_SCHEDULE_TIMEOUT / HZ;
 
+#define SCTP_CIPHER_SUITE_BUF_LEN	36
+#define SCTP_CIPHER_SUITES_BUF_MAX \
+	((SCTP_CIPHER_MAX + 1 - SCTP_CIPHER_MIN) * SCTP_CIPHER_SUITE_BUF_LEN)
+
 static int proc_sctp_do_hmac_alg(const struct ctl_table *ctl, int write,
 				 void *buffer, size_t *lenp, loff_t *ppos);
 static int proc_sctp_do_rto_min(const struct ctl_table *ctl, int write,
@@ -57,6 +61,9 @@ static int proc_sctp_do_auth(const struct ctl_table *ctl, int write,
 			     void *buffer, size_t *lenp, loff_t *ppos);
 static int proc_sctp_do_probe_interval(const struct ctl_table *ctl, int write,
 				       void *buffer, size_t *lenp, loff_t *ppos);
+static int proc_sctp_dtls_cipher_suites(const struct ctl_table *ctl, int write,
+					void *buffer, size_t *lenp,
+					loff_t *ppos);
 
 static struct ctl_table sctp_table[] = {
 	{
@@ -79,6 +86,12 @@ static struct ctl_table sctp_table[] = {
 		.maxlen		= sizeof(sysctl_sctp_wmem),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "sctp_dtls_cipher_suites",
+		.maxlen		= SCTP_CIPHER_SUITES_BUF_MAX,
+		.mode		= 0444,
+		.proc_handler	= proc_sctp_dtls_cipher_suites,
 	},
 };
 
@@ -583,6 +596,24 @@ static int proc_sctp_do_probe_interval(const struct ctl_table *ctl, int write,
 		net->sctp.probe_interval = new_value;
 	}
 
+	return ret;
+}
+
+static int proc_sctp_dtls_cipher_suites(const struct ctl_table *ctl, int write,
+					void *buffer, size_t *lenp,
+					loff_t *ppos)
+{
+	struct ctl_table tbl = { .maxlen = SCTP_CIPHER_SUITES_BUF_MAX, };
+	int ret;
+
+	tbl.data = kmalloc(tbl.maxlen, GFP_USER);
+	if (!tbl.data)
+		return -ENOMEM;
+
+	sctp_dtls_get_cipher_suites(tbl.data, SCTP_CIPHER_SUITES_BUF_MAX);
+	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
+
+	kfree(tbl.data);
 	return ret;
 }
 
