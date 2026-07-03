@@ -341,8 +341,6 @@ static int quic_packet_get_alpn(struct quic_data *alpn, u8 *p, u32 len)
 	return 0;
 }
 
-#define QUIC_FRAME_CRYPTO	0x06
-
 /* Parse ALPN from a QUIC Initial packet.
  *
  * This function processes a QUIC Initial packet to extract the ALPN from the
