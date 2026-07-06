@@ -325,6 +325,17 @@ static int quic_v6_get_sk_addr(struct socket *sock, struct sockaddr *uaddr,
 	return sizeof(struct sockaddr_in6);
 }
 
+static void quic_v4_set_sk_ecn(struct sock *sk, u8 ecn)
+{
+	inet_sk(sk)->tos = ((inet_sk(sk)->tos & ~INET_ECN_MASK) | ecn);
+}
+
+static void quic_v6_set_sk_ecn(struct sock *sk, u8 ecn)
+{
+	quic_v4_set_sk_ecn(sk, ecn);
+	inet6_sk(sk)->tclass = ((inet6_sk(sk)->tclass & ~INET_ECN_MASK) | ecn);
+}
+
 #define quic_af_ipv4(a)		((a)->sa.sa_family == AF_INET)
 
 u32 quic_encap_len(union quic_addr *a)
@@ -393,6 +404,12 @@ int quic_get_sk_addr(struct socket *sock, struct sockaddr *a, int peer)
 {
 	return quic_pf_ipv4(sock->sk) ? quic_v4_get_sk_addr(sock, a, peer) :
 					quic_v6_get_sk_addr(sock, a, peer);
+}
+
+void quic_set_sk_ecn(struct sock *sk, u8 ecn)
+{
+	quic_pf_ipv4(sk) ? quic_v4_set_sk_ecn(sk, ecn) :
+			   quic_v6_set_sk_ecn(sk, ecn);
 }
 
 int quic_get_dev_if(struct sock *sk, union quic_addr *a)

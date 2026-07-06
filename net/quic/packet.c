@@ -742,12 +742,58 @@ int quic_packet_config(struct sock *sk, u8 level, u8 path)
 	return quic_packet_route(sk);
 }
 
+static int quic_packet_xmit(struct sock *sk, struct sk_buff *skb, gfp_t gfp);
+
+void quic_packet_flush_txq(struct sock *sk)
+{
+	struct sk_buff_head *head;
+	struct quic_skb_cb *cb;
+	struct sk_buff *skb;
+
+	head = &sk->sk_write_queue;
+	if (quic_is_closed(sk)) { /* Socket closed: drop all pending skbs. */
+		__skb_queue_purge(head);
+		return;
+	}
+
+	while ((skb = __skb_dequeue(head)) != NULL) {
+		cb = QUIC_SKB_CB(skb);
+		if (quic_packet_config(sk, cb->level, cb->path)) {
+			kfree_skb(skb);
+			continue;
+		}
+		cb->resume = 1; /* Mark this skb as encrypted before sending. */
+		quic_packet_xmit(sk, skb, GFP_ATOMIC);
+	}
+	quic_packet_flush(sk);
+}
+
 static void quic_packet_encrypt_done(struct sk_buff *skb, int err)
 {
-	/* Free it for now, future patches will implement the actual deferred
-	 * transmission logic.
-	 */
-	kfree_skb(skb);
+	struct sock *sk = skb->sk;
+
+	if (err) {
+		QUIC_INC_STATS(sock_net(sk), QUIC_MIB_PKT_ENCDROP);
+		kfree_skb(skb);
+		pr_debug("%s: err: %d\n", __func__, err);
+		return;
+	}
+
+	sock_hold(sk);
+	local_bh_disable();
+	bh_lock_sock(sk);
+	__skb_queue_tail(&sk->sk_write_queue, skb);
+	if (sock_owned_by_user(sk)) {
+		if (!test_and_set_bit(QUIC_TXQ_DEFERRED, &sk->sk_tsq_flags))
+			sock_hold(sk);
+		goto out;
+	}
+
+	quic_packet_flush_txq(sk);
+out:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	sock_put(sk);
 }
 
 /* Coalescing Packets. */
@@ -872,6 +918,49 @@ void quic_packet_flush(struct sock *sk)
 				&paths->fl);
 		packet->head = NULL;
 	}
+}
+
+/* Append a frame to the tail of the current QUIC packet. */
+int quic_packet_tail(struct sock *sk, struct quic_frame *frame)
+{
+	struct quic_packet *packet = quic_packet(sk);
+
+	/* Reject frame if it doesn't match the packet's encryption level or
+	 * path, or if padding is already in place (no further frames should be
+	 * added).
+	 */
+	if (frame->level != (packet->level % QUIC_CRYPTO_EARLY) ||
+	    frame->path != packet->path || packet->padding)
+		return 0;
+
+	/* Check if frame would exceed the current datagram MSS (excluding AEAD
+	 * tag).
+	 */
+	if (packet->len + frame->len + frame->padding >
+	    packet->mss[frame->dgram]) {
+		/* If some data has already been added to packet, bail out. */
+		if (!quic_packet_empty(packet))
+			return 0;
+		/* Otherwise, allow IP fragmentation for this packet unless
+		 * it’s a PING probe.
+		 */
+		if (!quic_frame_ping(frame->type))
+			packet->ipfragok = 1;
+	}
+	if (frame->padding) {
+		packet->padding = frame->padding;
+		packet->len += frame->padding;
+	}
+
+	if (quic_frame_ack_eliciting(frame->type)) {
+		if (quic_frame_path_validating(frame->type))
+			packet->path_validating = 1;
+		packet->frames++;
+	}
+
+	list_move_tail(&frame->list, &packet->frame_list);
+	packet->len += frame->len;
+	return frame->len;
 }
 
 void quic_packet_init(struct sock *sk)

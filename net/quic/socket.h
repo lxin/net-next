@@ -24,6 +24,7 @@
 #include "packet.h"
 
 #include "protocol.h"
+#include "outqueue.h"
 #include "timer.h"
 
 extern struct proto quic_prot;
@@ -43,6 +44,7 @@ enum quic_tsq_enum {
 	QUIC_PATH_DEFERRED,
 	QUIC_PMTU_DEFERRED,
 	QUIC_PACE_DEFERRED,
+	QUIC_TXQ_DEFERRED,
 };
 
 enum quic_tsq_flags {
@@ -52,6 +54,7 @@ enum quic_tsq_flags {
 	QUIC_F_PATH_DEFERRED		= BIT(QUIC_PATH_DEFERRED),
 	QUIC_F_PMTU_DEFERRED		= BIT(QUIC_PMTU_DEFERRED),
 	QUIC_F_PACE_DEFERRED		= BIT(QUIC_PACE_DEFERRED),
+	QUIC_F_TXQ_DEFERRED		= BIT(QUIC_TXQ_DEFERRED),
 };
 
 #define QUIC_DEFERRED_ALL (QUIC_F_MTU_REDUCED_DEFERRED |	\
@@ -59,7 +62,8 @@ enum quic_tsq_flags {
 			   QUIC_F_SACK_DEFERRED |		\
 			   QUIC_F_PATH_DEFERRED |		\
 			   QUIC_F_PMTU_DEFERRED |		\
-			   QUIC_F_PACE_DEFERRED)
+			   QUIC_F_PACE_DEFERRED |		\
+			   QUIC_F_TXQ_DEFERRED)
 
 struct quic_sock {
 	struct inet_sock		inet;
@@ -77,6 +81,7 @@ struct quic_sock {
 	struct quic_pnspace		space[QUIC_PNSPACE_MAX];
 	struct quic_crypto		crypto[QUIC_CRYPTO_MAX];
 
+	struct quic_outqueue		outq;
 	struct quic_packet		packet;
 	struct quic_timer		timers[QUIC_TIMER_MAX];
 };
@@ -149,6 +154,11 @@ static inline struct quic_pnspace *quic_pnspace(const struct sock *sk, u8 level)
 static inline struct quic_crypto *quic_crypto(const struct sock *sk, u8 level)
 {
 	return &quic_sk(sk)->crypto[level];
+}
+
+static inline struct quic_outqueue *quic_outq(const struct sock *sk)
+{
+	return &quic_sk(sk)->outq;
 }
 
 static inline struct quic_packet *quic_packet(const struct sock *sk)

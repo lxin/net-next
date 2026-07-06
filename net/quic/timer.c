@@ -51,8 +51,38 @@ static void quic_timer_loss_timeout(struct timer_list *t)
 			   QUIC_LOSS_DEFERRED, quic_timer_loss_handler);
 }
 
+#define QUIC_MAX_ALT_PROBES	3
+
 void quic_timer_path_handler(struct sock *sk)
 {
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_probeinfo info = {};
+	gfp_t gfp = GFP_ATOMIC;
+	u64 timeout;
+
+	if (quic_is_closed(sk))
+		return;
+
+	if (quic_path_alt_state(paths, QUIC_PATH_ALT_PROBING)) {
+		/* Increment probe attempts; give up if exceeded max allowed. */
+		if (paths->alt_probes++ < QUIC_MAX_ALT_PROBES) {
+			quic_outq_transmit_frame(sk, QUIC_FRAME_PATH_CHALLENGE,
+						 NULL, 1, false, gfp);
+			timeout = max_t(u32, quic_cong(sk)->pto * 2,
+					QUIC_MIN_PATH_TIMEOUT);
+			goto out;
+		}
+		/* Probing failed; drop the alternate path. */
+		quic_path_unbind(sk, paths, 1);
+	}
+
+	/* Send PING to keep the path alive and help detect NAT rebinding. */
+	info.level = quic_is_established(sk) ? QUIC_CRYPTO_APP :
+					       QUIC_CRYPTO_INITIAL;
+	quic_outq_transmit_frame(sk, QUIC_FRAME_PING, &info, 0, false, gfp);
+	timeout = paths->keepalive_interval;
+out:
+	quic_timer_reset(sk, QUIC_TIMER_PATH, timeout);
 }
 
 static void quic_timer_path_timeout(struct timer_list *t)
@@ -63,6 +93,10 @@ static void quic_timer_path_timeout(struct timer_list *t)
 
 void quic_timer_pmtu_handler(struct sock *sk)
 {
+	if (quic_is_closed(sk))
+		return;
+
+	quic_outq_transmit_probe(sk, GFP_ATOMIC);
 }
 
 static void quic_timer_pmtu_timeout(struct timer_list *t)
@@ -73,6 +107,10 @@ static void quic_timer_pmtu_timeout(struct timer_list *t)
 
 void quic_timer_pace_handler(struct sock *sk)
 {
+	if (quic_is_closed(sk))
+		return;
+
+	quic_outq_transmit(sk, GFP_ATOMIC);
 }
 
 static enum hrtimer_restart quic_timer_pace_timeout(struct hrtimer *hr)

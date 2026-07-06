@@ -218,6 +218,7 @@ static int quic_init_sock(struct sock *sk)
 	quic_conn_id_set_init(quic_dest(sk), false);
 	quic_cong_init(quic_cong(sk));
 
+	quic_outq_init(sk);
 	quic_timer_init(sk);
 	quic_packet_init(sk);
 
@@ -236,6 +237,7 @@ static void quic_destroy_sock(struct sock *sk)
 {
 	u8 i;
 
+	quic_outq_free(sk);
 	quic_timer_free(sk);
 
 	for (i = 0; i < QUIC_PNSPACE_MAX; i++)
@@ -399,6 +401,10 @@ static void quic_release_cb(struct sock *sk)
 	}
 	if (flags & QUIC_F_PACE_DEFERRED) {
 		quic_timer_pace_handler(sk);
+		__sock_put(sk);
+	}
+	if (flags & QUIC_F_TXQ_DEFERRED) {
+		quic_packet_flush_txq(sk);
 		__sock_put(sk);
 	}
 }
