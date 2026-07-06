@@ -59,6 +59,26 @@ static u8 quic_packet_version_get_type(u32 version, u8 type)
 	}
 }
 
+/* Convert internal standard packet type to version-specific type. */
+static u8 quic_packet_version_put_type(u32 version, u8 type)
+{
+	if (version == QUIC_VERSION_V1)
+		return type;
+
+	switch (type) {
+	case QUIC_PACKET_INITIAL:
+		return QUIC_PACKET_INITIAL_V2;
+	case QUIC_PACKET_0RTT:
+		return QUIC_PACKET_0RTT_V2;
+	case QUIC_PACKET_HANDSHAKE:
+		return QUIC_PACKET_HANDSHAKE_V2;
+	case QUIC_PACKET_RETRY:
+		return QUIC_PACKET_RETRY_V2;
+	default:
+		return QUIC_PACKET_INVALID;
+	}
+}
+
 /* Extracts a QUIC Connection ID from a buffer in the long header packet. */
 static int quic_packet_get_connid(struct quic_conn_id *connid, u8 **pp,
 				  u32 *plen)
@@ -562,6 +582,252 @@ err:
 	return err;
 }
 
+/* rfc9000#section-17.2.5:
+ *
+ * Retry Packet {
+ *   Header Form (1) = 1,
+ *   Fixed Bit (1) = 1,
+ *   Long Packet Type (2) = 3,
+ *   Unused (4),
+ *   Version (32),
+ *   Destination Connection ID Length (8),
+ *   Destination Connection ID (0..160),
+ *   Source Connection ID Length (8),
+ *   Source Connection ID (0..160),
+ *   Retry Token (..),
+ *   Retry Integrity Tag (128),
+ * }
+ *
+ * A Retry packet uses a long packet header with a type value of 0x03. It
+ * carries an address validation token created by the server. It is used by a
+ * server that wishes to perform a retry.
+ */
+static __maybe_unused int quic_packet_retry_create_and_xmit(struct sock *sk)
+{
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	u8 *p, buf[QUIC_FRAME_BUF_LARGE], tag[QUIC_TAG_LEN];
+	struct quic_packet *packet = quic_packet(sk);
+	union quic_addr *da = &packet->daddr;
+	struct quic_conn_id conn_id = {};
+	struct quichshdr *hdr;
+	struct sk_buff *skb;
+	u32 len, tlen, hlen;
+	struct flowi fl;
+	int err;
+
+	/* Clear routing cache and compute flow route. */
+	__sk_dst_reset(sk);
+	err = quic_flow_route(sk, da, &packet->saddr, &fl);
+	if (err < 0)
+		return err;
+
+	/* Write token flags into buffer: QUIC_TOKEN_FLAG_RETRY means retry
+	 * token.
+	 */
+	quic_put_int(buf, QUIC_TOKEN_FLAG_RETRY, 1);
+	/* Generate retry token using client's address and DCID from client
+	 * initial packet.
+	 */
+	err = quic_crypto_generate_token(crypto, da, sizeof(*da), &packet->dcid,
+					 buf, &tlen);
+	if (err)
+		return err;
+
+	/* Generate new SCID for the Retry packet. */
+	quic_conn_id_generate(&conn_id);
+	/* Compute total packet length: header + token + integrity tag. */
+	len = QUIC_LONG_HLEN(&packet->scid, &conn_id) + tlen + QUIC_TAG_LEN;
+	hlen = quic_encap_len(da) + MAX_HEADER;
+	skb = alloc_skb(hlen + len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	skb_reserve(skb, (int)(hlen + len));
+
+	/* Build Long Packet header. */
+	hdr = skb_push(skb, len);
+	hdr->form = QUIC_PACKET_FORM_LONG;
+	hdr->fixed = !quic_outq(sk)->grease_quic_bit;
+	hdr->type = quic_packet_version_put_type(packet->version,
+						 QUIC_PACKET_RETRY);
+	hdr->reserved = 0;
+	hdr->pnl = 0;
+
+	/* Write the QUIC version. */
+	p = (u8 *)hdr + QUIC_HLEN;
+	p = quic_put_int(p, packet->version, QUIC_VERSION_LEN);
+	/* Write Destination Connection ID. */
+	p = quic_put_int(p, packet->scid.len, 1);
+	p = quic_put_data(p, packet->scid.data, packet->scid.len);
+	/* Write Source Connection ID. */
+	p = quic_put_int(p, conn_id.len, 1);
+	p = quic_put_data(p, conn_id.data, conn_id.len);
+	/* Write Retry Token. */
+	p = quic_put_data(p, buf, tlen);
+	/* Generate and write Retry Integrity Tag.*/
+	err = quic_crypto_get_retry_tag(crypto, skb, &packet->dcid,
+					packet->version, tag);
+	if (err) {
+		kfree_skb(skb);
+		return err;
+	}
+	quic_put_data(p, tag, QUIC_TAG_LEN);
+
+	/* Transmit the Retry packet. */
+	quic_lower_xmit(sk, skb, da, &fl);
+	return 0;
+}
+
+/* rfc9000#section-17.2.1:
+ *
+ * Version Negotiation Packet {
+ *   Header Form (1) = 1,
+ *   Unused (7),
+ *   Version (32) = 0,
+ *   Destination Connection ID Length (8),
+ *   Destination Connection ID (0..2040),
+ *   Source Connection ID Length (8),
+ *   Source Connection ID (0..2040),
+ *   Supported Version (32) ...,
+ * }
+ *
+ * A Version Negotiation packet is inherently not version specific. Upon
+ * receipt by a client, it will be identified as a Version Negotiation packet
+ * based on the Version field having a value of 0.
+ *
+ * The Version Negotiation packet is a response to a client packet that
+ * contains a version that is not supported by the server. It is only sent by
+ * servers.
+ */
+static __maybe_unused int quic_packet_version_create_and_xmit(struct sock *sk)
+{
+	struct quic_packet *packet = quic_packet(sk);
+	union quic_addr *da = &packet->daddr;
+	struct quichshdr *hdr;
+	struct sk_buff *skb;
+	u32 len, hlen, i;
+	struct flowi fl;
+	int err;
+	u8 *p;
+
+	/* Clear routing cache and compute flow route. */
+	__sk_dst_reset(sk);
+	err = quic_flow_route(sk, da, &packet->saddr, &fl);
+	if (err < 0)
+		return err;
+
+	/* Compute packet length: header + supported version list. */
+	len = QUIC_LONG_HLEN(&packet->dcid, &packet->scid) +
+	      QUIC_VERSION_LEN * QUIC_VERSION_NUM;
+	hlen = quic_encap_len(da) + MAX_HEADER;
+	skb = alloc_skb(hlen + len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	skb_reserve(skb, (int)(hlen + len));
+
+	/* Build Long Packet header. */
+	hdr = skb_push(skb, len);
+	hdr->form = QUIC_PACKET_FORM_LONG;
+	hdr->fixed = !quic_outq(sk)->grease_quic_bit;
+	hdr->type = 0;
+	hdr->reserved = 0;
+	hdr->pnl = 0;
+
+	/* Write zero version. */
+	p = (u8 *)hdr + QUIC_HLEN;
+	p = quic_put_int(p, 0, QUIC_VERSION_LEN);
+	/* Write Destination Connection ID. */
+	p = quic_put_int(p, packet->scid.len, 1);
+	p = quic_put_data(p, packet->scid.data, packet->scid.len);
+	/* Write Source Connection ID. */
+	p = quic_put_int(p, packet->dcid.len, 1);
+	p = quic_put_data(p, packet->dcid.data, packet->dcid.len);
+
+	/* Write Supported Versions. */
+	for (i = 0; i < QUIC_VERSION_NUM; i++)
+		p = quic_put_int(p, quic_versions[i][0], QUIC_VERSION_LEN);
+
+	/* Transmit the Version Negotiation packet. */
+	quic_lower_xmit(sk, skb, da, &fl);
+	return 0;
+}
+
+#define QUIC_STATELESS_RESET_DEF_LEN	64
+#define QUIC_STATELESS_RESET_MIN_LEN	(QUIC_HLEN + 5 + QUIC_CONN_ID_TOKEN_LEN)
+
+/* rfc9000#section-10.3:
+ *
+ * Stateless Reset {
+ *   Fixed Bits (2) = 1,
+ *   Unpredictable Bits (38..),
+ *   Stateless Reset Token (128),
+ * }
+ *
+ * A stateless reset is provided as an option of last resort for an endpoint
+ * that does not have access to the state of a connection. A crash or outage
+ * might result in peers continuing to send data to an endpoint that is unable
+ * to properly continue the connection. An endpoint MAY send a Stateless Reset
+ * in response to receiving a packet that it cannot associate with an active
+ * connection.
+ */
+static __maybe_unused int
+quic_packet_stateless_reset_create_and_xmit(struct sock *sk, u32 len, gfp_t gfp)
+{
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	struct quic_packet *packet = quic_packet(sk);
+	u32 hlen, tlen = QUIC_CONN_ID_TOKEN_LEN;
+	union quic_addr *da = &packet->daddr;
+	u8 *p, token[QUIC_CONN_ID_TOKEN_LEN];
+	struct sk_buff *skb;
+	struct flowi fl;
+	int err;
+
+	/* rfc9000#section-10.3.3:
+	 *
+	 * An endpoint MUST ensure that every Stateless Reset that it sends is
+	 * smaller than the packet that triggered it, unless it maintains state
+	 * sufficient to prevent looping. In the event of a loop, this results
+	 * in packets eventually being too small to trigger a response.
+	 */
+	if (len <= QUIC_STATELESS_RESET_MIN_LEN)
+		return -EINVAL;
+	len = min_t(u32, QUIC_STATELESS_RESET_DEF_LEN, len - 1);
+
+	/* Clear routing cache and compute flow route. */
+	__sk_dst_reset(sk);
+	err = quic_flow_route(sk, da, &packet->saddr, &fl);
+	if (err < 0)
+		return err;
+
+	/* Generate stateless reset token from DCID in the packet received. */
+	err = quic_crypto_derive_secret(crypto, packet->dcid.data,
+					packet->dcid.len, "stateless_reset",
+					token, tlen);
+	if (err)
+		return err;
+
+	hlen = quic_encap_len(da) + MAX_HEADER;
+	skb = alloc_skb(hlen + len, gfp);
+	if (!skb)
+		return -ENOMEM;
+	skb_reserve(skb, (int)(hlen + len));
+
+	p = skb_push(skb, len);
+	/* Write Unpredictable Bits. */
+	get_random_bytes(p, len);
+
+	/* Build Short Packet header. */
+	quic_hdr(skb)->form = QUIC_PACKET_FORM_SHORT;
+	quic_hdr(skb)->fixed = 1;
+
+	/* Write end of packet with stateless reset token. */
+	p += (len - QUIC_CONN_ID_TOKEN_LEN);
+	quic_put_data(p, token, QUIC_CONN_ID_TOKEN_LEN);
+
+	/* Transmit the Stateless Reset packet. */
+	quic_lower_xmit(sk, skb, da, &fl);
+	return 0;
+}
+
 static int quic_packet_listen_process(struct sock *sk, struct sk_buff *skb,
 				      gfp_t gfp)
 {
@@ -627,19 +893,425 @@ void quic_packet_backlog_work(struct work_struct *work)
 #define QUIC_PACKET_NUMBER_LEN	QUIC_PN_MAX_LEN
 #define QUIC_PACKET_LENGTH_LEN	4
 
+#define QUIC_MAX_ECN_PROBES	3
+
+static void quic_packet_pack_frames(struct sock *sk, struct sk_buff *skb,
+				    struct quic_packet_sent *sent, u16 off)
+{
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	struct quic_frame *frame, *next;
+	u64 now = quic_ktime_get_us();
+	struct quic_frame_frag *frag;
+	struct quic_pnspace *space;
+	u8 *p = skb->data + off;
+	s64 number;
+	u16 i = 0;
+
+	space = quic_pnspace(sk, packet->level);
+	number = space->next_pn++;
+
+	/* Store packet metadata in skb CB for later use (e.g., encryption). */
+	cb->number_len = QUIC_PACKET_NUMBER_LEN;
+	cb->number_offset = off;
+	cb->number = number;
+	cb->level = packet->level;
+	cb->path = packet->path;
+
+	p = quic_put_int(p, number, cb->number_len); /* Write packet number. */
+
+	list_for_each_entry_safe(frame, next, &packet->frame_list, list) {
+		list_del(&frame->list);
+		/* Write main frame data and appended fragments. */
+		p = quic_put_data(p, frame->data, frame->dlen);
+		for (frag = frame->flist; frag; frag = frag->next)
+			p = quic_put_data(p, frag->data, frag->dlen);
+		pr_debug("%s: num=%llu type=%u len=%u frame_len=%u level=%u\n",
+			 __func__, number, frame->type, skb->len, frame->len,
+			 packet->level);
+		if (!quic_frame_ack_eliciting(frame->type)) {
+			/* CONNECTION_CLOSE must be encrypted synchronously. */
+			if (quic_frame_close(frame->type))
+				cb->sync = 1;
+			/* Skip non-ACK-eliciting frames for tracking. */
+			quic_frame_put(frame);
+			continue;
+		}
+		if (frame->number < 0) {
+			/* First time sending: record packet number and adjust
+			 * unsent byte count.
+			 */
+			frame->number = number;
+			outq->unsent_bytes -= frame->bytes;
+		}
+		/* Move frame to transmitted queue. */
+		quic_outq_transmitted_tail(sk, frame);
+		/* Hold frame in sent packet record. */
+		sent->frame_array[i++] = quic_frame_get(frame);
+	}
+
+	if (packet->padding) /* Pack the padding frame if any. */
+		memset(p, 0, packet->padding);
+
+	/* Track bytes sent before address validation to respect amplification
+	 * limits for server.
+	 */
+	if (quic_is_serv(sk) && !paths->validated)
+		paths->ampl_sndlen += packet->len;
+
+	if (!sent) /* Packet doesn't need ACK/loss tracking. */
+		return;
+
+	/* Update the last sent timestamp if this packet is ACK-eliciting.
+	 * This is important for loss detection and PTO (Probe Timeout) logic.
+	 */
+	space->last_sent_time = now;
+
+	/* rfc9000#section-13.4.2:
+	 *
+	 * To perform ECN validation for a new path:
+	 *
+	 * The endpoint sets an ECT(0) codepoint in the IP header of early
+	 * outgoing packets sent on a new path to the peer.
+	 */
+	if (!packet->level && paths->ecn_probes < QUIC_MAX_ECN_PROBES &&
+	    quic_path_alt_state(paths, QUIC_PATH_ALT_NONE)) {
+		paths->ecn_probes++;
+		cb->ecn = INET_ECN_ECT_0;
+		sent->ecn = INET_ECN_ECT_0;
+	}
+	/* Fill metadata for this sent packet.  Convert CRYPTO level to PN
+	 * space level since 0-RTT and 1-RTT share PN space.
+	 */
+	sent->number = number;
+	sent->sent_time = now;
+	sent->len = packet->len;
+	sent->level = (packet->level % QUIC_CRYPTO_EARLY);
+
+	space->inflight += sent->len;
+	outq->inflight += sent->len;
+	/* Append packet to sent list for loss and ACK tracking. */
+	quic_outq_packet_sent_tail(sk, sent);
+
+	/* Call cong.on_packet_sent() where it does pacing time update. */
+	quic_cong_on_packet_sent(quic_cong(sk), sent->sent_time, sent->len,
+				 number);
+	/* Refresh loss detection timer after sending data. */
+	quic_outq_update_loss_timer(sk);
+}
+
+static struct quic_packet_sent *quic_packet_sent_alloc(u16 frames, gfp_t gfp)
+{
+	u32 len = frames * sizeof(struct quic_frame *);
+	struct quic_packet_sent *sent;
+
+	sent = kmalloc(sizeof(*sent) + len, gfp | __GFP_ACCOUNT);
+	if (sent) {
+		sent->frames = frames;
+		sent->ecn = 0;
+	}
+
+	return sent;
+}
+
+/* rfc9000#section-17.2.2:
+ *
+ * Initial Packet {
+ *   Header Form (1) = 1,
+ *   Fixed Bit (1) = 1,
+ *   Long Packet Type (2) = 0,
+ *   Reserved Bits (2),
+ *   Packet Number Length (2),
+ *   Version (32),
+ *   Destination Connection ID Length (8),
+ *   Destination Connection ID (0..160),
+ *   Source Connection ID Length (8),
+ *   Source Connection ID (0..160),
+ *   Token Length (i),
+ *   Token (..),
+ *   Length (i),
+ *   Packet Number (8..32),
+ *   Packet Payload (8..),
+ * }
+ *
+ * An Initial packet uses long headers with a type value of 0x00. It carries
+ * the first CRYPTO frames sent by the client and server to perform key
+ * exchange, and it carries ACK frames in either direction.
+ *
+ * rfc9000#section-17.2.4:
+ *
+ * Handshake Packet {
+ *   Header Form (1) = 1,
+ *   Fixed Bit (1) = 1,
+ *   Long Packet Type (2) = 2,
+ *   Reserved Bits (2),
+ *   Packet Number Length (2),
+ *   Version (32),
+ *   Destination Connection ID Length (8),
+ *   Destination Connection ID (0..160),
+ *   Source Connection ID Length (8),
+ *   Source Connection ID (0..160),
+ *   Length (i),
+ *   Packet Number (8..32),
+ *   Packet Payload (8..),
+ * }
+ *
+ * A Handshake packet uses long headers with a type value of 0x02, followed by
+ * the Length and Packet Number fields. The first byte contains the Reserved
+ * and Packet Number Length bits. It is used to carry cryptographic handshake
+ * messages and acknowledgments from the server and client.
+ *
+ * rfc9000#section-17.2.3:
+ *
+ * 0-RTT Packet {
+ *   Header Form (1) = 1,
+ *   Fixed Bit (1) = 1,
+ *   Long Packet Type (2) = 1,
+ *   Reserved Bits (2),
+ *   Packet Number Length (2),
+ *   Version (32),
+ *   Destination Connection ID Length (8),
+ *   Destination Connection ID (0..160),
+ *   Source Connection ID Length (8),
+ *   Source Connection ID (0..160),
+ *   Length (i),
+ *   Packet Number (8..32),
+ *   Packet Payload (8..),
+ * }
+ *
+ * A 0-RTT packet uses long headers with a type value of 0x01, followed by the
+ * Length and Packet Number fields. The first byte contains the Reserved and
+ * Packet Number Length bits. A 0-RTT packet is used to carry "early" data from
+ * the client to the server as part of the first flight, prior to handshake
+ * completion.
+ */
 static struct sk_buff *quic_packet_handshake_create(struct sock *sk, gfp_t gfp)
 {
-	return NULL;
+	struct quic_conn_id_set *source = quic_source(sk);
+	struct quic_conn_id_set *dest = quic_dest(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	u8 type, fixed = 1, level = packet->level;
+	struct quic_packet_sent *sent = NULL;
+	struct quic_conn_id *active;
+	struct quichshdr *hdr;
+	struct sk_buff *skb;
+	u32 len, hlen;
+	u16 off;
+	u8 *p;
+
+	/* Determine packet type based on encryption level. */
+	type = QUIC_PACKET_INITIAL;
+	if (level == QUIC_CRYPTO_HANDSHAKE) {
+		type = QUIC_PACKET_HANDSHAKE;
+		fixed = !quic_outq(sk)->grease_quic_bit;
+	} else if (level == QUIC_CRYPTO_EARLY) {
+		type = QUIC_PACKET_0RTT;
+	}
+
+	if (packet->frames || !quic_is_serv(sk)) {
+		/* rfc9000#section-14.1:
+		 *
+		 * A client MUST expand the payload of all UDP datagrams
+		 * carrying Initial packets to at least the smallest allowed
+		 * maximum datagram size of 1200 bytes by adding PADDING frames
+		 * to the Initial packet or by coalescing the Initial packet.
+		 * Similarly, a server MUST expand the payload of all UDP
+		 * datagrams carrying ack-eliciting Initial packets to at least
+		 * the smallest allowed maximum datagram size of 1200 bytes.
+		 */
+		if (level == QUIC_CRYPTO_INITIAL) {
+			len = QUIC_MIN_UDP_PAYLOAD;
+			if (packet->len < len) {
+				packet->padding = len - packet->len;
+				packet->len = len;
+			}
+		}
+	}
+	len = packet->len - quic_packet_taglen(packet);
+	if (packet->frames) {
+		/* If there are ack-eliciting frames, create packet_sent for
+		 * acknowledge and loss detection.
+		 */
+		sent = quic_packet_sent_alloc(packet->frames, gfp);
+		if (!sent) { /* Move pending frames back to the outqueue. */
+			pr_debug("%s: failed, frames: %d\n", __func__,
+				 packet->frames);
+			quic_outq_retransmit_list(sk, &packet->frame_list);
+			return NULL;
+		}
+	}
+
+	/* Allocate skb with space for header + payload + AEAD taglen of Long
+	 * Packet.
+	 */
+	hlen = packet->hlen + MAX_HEADER;
+	skb = alloc_skb(hlen + packet->len, gfp);
+	if (!skb) {
+		kfree(sent);
+		quic_outq_retransmit_list(sk, &packet->frame_list);
+		return NULL;
+	}
+	skb->ignore_df = packet->ipfragok;
+	skb_reserve(skb, (int)(hlen + len));
+
+	/* Build Long Packet header. */
+	hdr = skb_push(skb, len);
+	hdr->form = QUIC_PACKET_FORM_LONG;
+	hdr->fixed = fixed;
+	hdr->type = quic_packet_version_put_type(packet->version, type);
+	hdr->reserved = 0;
+	hdr->pnl = QUIC_PACKET_NUMBER_LEN - 1;
+
+	/* Write the QUIC version. */
+	p = (u8 *)hdr + QUIC_HLEN;
+	p = quic_put_int(p, packet->version, QUIC_VERSION_LEN);
+
+	/* Write Destination Connection ID. */
+	active = quic_conn_id_active(dest);
+	p = quic_put_int(p, active->len, 1);
+	p = quic_put_data(p, active->data, active->len);
+
+	/* Write Source Connection ID. */
+	active = quic_conn_id_active(source);
+	p = quic_put_int(p, active->len, 1);
+	p = quic_put_data(p, active->data, active->len);
+
+	/* Write Token if needed. */
+	if (level == QUIC_CRYPTO_INITIAL) { /* Only Initial carries tokens. */
+		hlen = 0;
+		if (!quic_is_serv(sk)) /* Only clients send tokens. */
+			hlen = quic_token(sk)->len;
+		p = quic_put_var(p, hlen);
+		p = quic_put_data(p, quic_token(sk)->data, hlen);
+	}
+
+	/* Write Length. */
+	off = (u16)(p + QUIC_PACKET_LENGTH_LEN - skb->data);
+	p = quic_put_varint(p, packet->len - off, QUIC_PACKET_LENGTH_LEN);
+
+	/* Pack Packet Number and actual frames starting at offset 'off'. */
+	quic_packet_pack_frames(sk, skb, sent, off);
+	return skb;
 }
 
+/* Ensures the packet number is within the valid range. */
 static int quic_packet_number_check(struct sock *sk, gfp_t gfp)
 {
-	return 0;
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_pnspace *space;
+
+	/* Check if the next packet number is within the allowed range. */
+	space = quic_pnspace(sk, packet->level);
+	if (space->next_pn + 1 <= QUIC_PN_MAX)
+		return 0;
+
+	/* Move pending frames back to the outqueue. */
+	quic_outq_retransmit_list(sk, &packet->frame_list);
+
+	/* rfc9000#section-12.3:
+	 *
+	 * If the packet number for sending reaches 2^62-1, the sender MUST
+	 * close the connection without sending a CONNECTION_CLOSE frame or any
+	 * further packets.
+	 */
+	if (!quic_is_closed(sk)) {
+		struct quic_connection_close c = {};
+
+		/* Notify application that the connection is being closed. */
+		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_CLOSE, &c,
+				    sizeof(c), gfp);
+		quic_set_state(sk, QUIC_SS_CLOSED);
+	}
+	return -EPIPE;
 }
 
+/* rfc9000#section-17.3.1:
+ *
+ * 1-RTT Packet {
+ *   Header Form (1) = 0,
+ *   Fixed Bit (1) = 1,
+ *   Spin Bit (1),
+ *   Reserved Bits (2),
+ *   Key Phase (1),
+ *   Packet Number Length (2),
+ *   Destination Connection ID (0..160),
+ *   Packet Number (8..32),
+ *   Packet Payload (8..),
+ * }
+ *
+ * A 1-RTT packet uses a short packet header. It is used after the version and
+ * 1-RTT keys are negotiated.
+ */
 static struct sk_buff *quic_packet_app_create(struct sock *sk, gfp_t gfp)
 {
-	return NULL;
+	struct quic_conn_id_set *id_set = quic_dest(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_packet_sent *sent = NULL;
+	struct quic_conn_id *active;
+	struct sk_buff *skb;
+	struct quichdr *hdr;
+	u32 len, hlen;
+	u16 off;
+
+	if (packet->frames) {
+		if (packet->path_validating) {
+			/* rfc9000#section-8.2:
+			 *
+			 * An endpoint MUST expand datagrams that contain a
+			 * PATH_CHALLENGE/PATH_RESPONSE frame to at least the
+			 * smallest allowed maximum datagram size of 1200
+			 * bytes.
+			 */
+			len = QUIC_MIN_UDP_PAYLOAD;
+			if (packet->len < len) {
+				packet->padding = len - packet->len;
+				packet->len = len;
+			}
+		}
+		/* If there are ack-eliciting frames, create packet_sent for
+		 * acknowledge and loss detection.
+		 */
+		sent = quic_packet_sent_alloc(packet->frames, gfp);
+		if (!sent) { /* Move pending frames back to the outqueue. */
+			pr_debug("%s: failed, frames: %d\n", __func__,
+				 packet->frames);
+			quic_outq_retransmit_list(sk, &packet->frame_list);
+			return NULL;
+		}
+	}
+
+	/* Allocate skb with space for header + payload + AEAD taglen of Short
+	 * Packet.
+	 */
+	len = packet->len - quic_packet_taglen(packet);
+	hlen = packet->hlen + MAX_HEADER;
+	skb = alloc_skb(hlen + packet->len, gfp);
+	if (!skb) { /* Move pending frames back to the outqueue. */
+		kfree(sent);
+		quic_outq_retransmit_list(sk, &packet->frame_list);
+		return NULL;
+	}
+	skb->ignore_df = packet->ipfragok;
+	skb_reserve(skb, (int)(hlen + len));
+
+	/* Build Short Packet header. */
+	hdr = skb_push(skb, len);
+	hdr->form = QUIC_PACKET_FORM_SHORT;
+	hdr->fixed = !quic_outq(sk)->grease_quic_bit;
+	hdr->spin = 0;
+	hdr->reserved = 0;
+	hdr->pnl = QUIC_PACKET_NUMBER_LEN - 1;
+
+	/* Choose the active destination connection ID based on path. */
+	active = quic_conn_id_choose(id_set, packet->path);
+	quic_put_data((u8 *)hdr + QUIC_HLEN, active->data, active->len);
+	off = (u16)(active->len + sizeof(struct quichdr));
+
+	/* Pack Packet Number and actual frames starting at offset 'off'. */
+	quic_packet_pack_frames(sk, skb, sent, off);
+	return skb;
 }
 
 /* Update the MSS and inform congestion control. */
