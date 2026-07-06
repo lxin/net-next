@@ -28,6 +28,7 @@ void quic_udp_conf_init(struct sock *sk, struct udp_port_cfg *conf,
 void quic_get_msg_addrs(struct sk_buff *skb, union quic_addr *da,
 			union quic_addr *sa);
 int quic_get_mtu_info(struct sk_buff *skb, u32 *info);
+u8 quic_get_msg_ecn(struct sk_buff *skb);
 
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 		      union quic_addr *addr);

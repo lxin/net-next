@@ -33,6 +33,34 @@ out:
 
 void quic_timer_sack_handler(struct sock *sk)
 {
+	struct quic_pnspace *space = quic_pnspace(sk, QUIC_CRYPTO_APP);
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_connection_close c = {};
+	gfp_t gfp = GFP_ATOMIC;
+
+	if (quic_is_closed(sk))
+		return;
+
+	if (inq->sack_flag == QUIC_SACK_FLAG_NONE) {
+		/* Idle timer expired, close the connection. */
+		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_CLOSE, &c,
+				    sizeof(c), gfp);
+		quic_set_state(sk, QUIC_SS_CLOSED);
+
+		pr_debug("%s: idle timeout\n", __func__);
+		return;
+	}
+
+	if (inq->sack_flag == QUIC_SACK_FLAG_APP && space->sack_pending) {
+		space->need_sack = 1; /* Request APP-level ACK. */
+		space->sack_path = 0; /* Send ACK on active path. */
+		space->sack_pending = 0;
+	}
+
+	/* Transmit queued frames, including ACKs. */
+	quic_outq_transmit(sk, gfp);
+	inq->sack_flag = QUIC_SACK_FLAG_NONE; /* Start as idle timer. */
+	quic_timer_start(sk, QUIC_TIMER_IDLE, inq->timeout);
 }
 
 static void quic_timer_sack_timeout(struct timer_list *t)

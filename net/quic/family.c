@@ -251,6 +251,16 @@ static int quic_v6_get_mtu_info(struct sk_buff *skb, u32 *info)
 	return -EINVAL;
 }
 
+static u8 quic_v4_get_msg_ecn(struct sk_buff *skb)
+{
+	return (ip_hdr(skb)->tos & INET_ECN_MASK);
+}
+
+static u8 quic_v6_get_msg_ecn(struct sk_buff *skb)
+{
+	return (ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK);
+}
+
 static bool quic_v4_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 				union quic_addr *addr)
 {
@@ -423,6 +433,12 @@ int quic_get_mtu_info(struct sk_buff *skb, u32 *info)
 {
 	return quic_skb_ipv4(skb) ? quic_v4_get_mtu_info(skb, info) :
 				    quic_v6_get_mtu_info(skb, info);
+}
+
+u8 quic_get_msg_ecn(struct sk_buff *skb)
+{
+	return quic_skb_ipv4(skb) ? quic_v4_get_msg_ecn(skb) :
+				    quic_v6_get_msg_ecn(skb);
 }
 
 #define quic_pf_ipv4(sk)	((sk)->sk_family == PF_INET)

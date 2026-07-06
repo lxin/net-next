@@ -123,6 +123,7 @@ int quic_packet_config(struct sock *sk, u8 level, u8 path);
 
 int quic_packet_create_and_xmit(struct sock *sk, gfp_t gfp);
 void quic_packet_flush_txq(struct sock *sk);
+void quic_packet_flush_rxq(struct sock *sk);
 int quic_packet_route(struct sock *sk);
 
 void quic_packet_mss_update(struct sock *sk, u32 mss);

@@ -46,6 +46,7 @@ enum quic_tsq_enum {
 	QUIC_PMTU_DEFERRED,
 	QUIC_PACE_DEFERRED,
 	QUIC_TXQ_DEFERRED,
+	QUIC_RXQ_DEFERRED,
 };
 
 enum quic_tsq_flags {
@@ -56,6 +57,7 @@ enum quic_tsq_flags {
 	QUIC_F_PMTU_DEFERRED		= BIT(QUIC_PMTU_DEFERRED),
 	QUIC_F_PACE_DEFERRED		= BIT(QUIC_PACE_DEFERRED),
 	QUIC_F_TXQ_DEFERRED		= BIT(QUIC_TXQ_DEFERRED),
+	QUIC_F_RXQ_DEFERRED		= BIT(QUIC_RXQ_DEFERRED),
 };
 
 #define QUIC_DEFERRED_ALL (QUIC_F_MTU_REDUCED_DEFERRED |	\
@@ -64,7 +66,24 @@ enum quic_tsq_flags {
 			   QUIC_F_PATH_DEFERRED |		\
 			   QUIC_F_PMTU_DEFERRED |		\
 			   QUIC_F_PACE_DEFERRED |		\
-			   QUIC_F_TXQ_DEFERRED)
+			   QUIC_F_TXQ_DEFERRED |		\
+			   QUIC_F_RXQ_DEFERRED)
+
+struct quic_request_sock {
+	struct list_head	list;
+
+	struct quic_conn_id	dcid;
+	struct quic_conn_id	scid;
+	union quic_addr		daddr;
+	union quic_addr		saddr;
+
+	struct quic_conn_id	orig_dcid;
+	u32			version;
+	u8			retry;
+
+	struct sk_buff_head	backlog_list;
+	u32			blen;
+};
 
 struct quic_sock {
 	struct inet_sock		inet;
@@ -225,3 +244,12 @@ struct sock *quic_listen_sock_lookup(struct sk_buff *skb, union quic_addr *sa,
 struct sock *quic_sock_lookup(struct sk_buff *skb, union quic_addr *sa,
 			      union quic_addr *da, struct sock *usk,
 			      struct quic_conn_id *dcid);
+bool quic_accept_sock_exists(struct sock *sk, struct sk_buff *skb);
+
+struct quic_request_sock *quic_request_sock_create(struct sock *sk,
+						   struct quic_conn_id *odcid,
+						   u8 retry, gfp_t gfp);
+int quic_request_sock_backlog_tail(struct sock *sk,
+				   struct quic_request_sock *req,
+				   struct sk_buff *skb);
+struct quic_request_sock *quic_request_sock_lookup(struct sock *sk);
