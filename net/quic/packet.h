@@ -35,6 +35,19 @@ struct quic_packet {
 	u8 level;             /* Encryption level used */
 };
 
+struct quic_packet_sent {
+	struct list_head list; /* Link in sent packet list for ACK tracking */
+	u64 sent_time;         /* Timestamp when packet was sent */
+	s64 number;            /* Packet number */
+	u8  level;             /* Packet number space */
+	u8  ecn:2;             /* ECN bits */
+
+	u16 frames; /* Number of frames held */
+	u16 len;    /* The sent packet length including taglen */
+
+	struct quic_frame *frame_array[]; /* Array of pointers to held frames */
+};
+
 #define QUIC_PACKET_INITIAL_V1		0
 #define QUIC_PACKET_0RTT_V1		1
 #define QUIC_PACKET_HANDSHAKE_V1	2
