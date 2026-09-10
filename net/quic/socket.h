@@ -20,6 +20,7 @@
 #include "path.h"
 #include "cong.h"
 
+#include "frame.h"
 #include "packet.h"
 
 #include "protocol.h"

@@ -259,8 +259,6 @@ static int quic_packet_deferred_schedule(struct sk_buff *skb)
 #define TLS_CH_VERSION_LEN	2
 #define TLS_MAX_EXTENSIONS	128
 
-#define QUIC_FRAME_CRYPTO	0x06
-
 /* Decrypt Initial packet and extract ALPN from TLS ClientHello for ALPN-based
  * socket demultiplexing. Marks packet as decrypted (cb->resume = 1) to avoid
  * redundant decryption later.
