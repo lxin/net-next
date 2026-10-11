@@ -46,6 +46,7 @@ enum quic_tsq_enum {
 	QUIC_PMTU_DEFERRED,
 	QUIC_PACE_DEFERRED,
 	QUIC_TXQ_DEFERRED,
+	QUIC_RXQ_DEFERRED,
 };
 
 enum quic_tsq_flags {
@@ -56,6 +57,7 @@ enum quic_tsq_flags {
 	QUIC_F_PMTU_DEFERRED		= BIT(QUIC_PMTU_DEFERRED),
 	QUIC_F_PACE_DEFERRED		= BIT(QUIC_PACE_DEFERRED),
 	QUIC_F_TXQ_DEFERRED		= BIT(QUIC_TXQ_DEFERRED),
+	QUIC_F_RXQ_DEFERRED		= BIT(QUIC_RXQ_DEFERRED),
 };
 
 #define QUIC_DEFERRED_ALL (QUIC_F_MTU_REDUCED_DEFERRED |	\
@@ -64,7 +66,8 @@ enum quic_tsq_flags {
 			   QUIC_F_PATH_DEFERRED |		\
 			   QUIC_F_PMTU_DEFERRED |		\
 			   QUIC_F_PACE_DEFERRED |		\
-			   QUIC_F_TXQ_DEFERRED)
+			   QUIC_F_TXQ_DEFERRED |		\
+			   QUIC_F_RXQ_DEFERRED)
 
 struct quic_request_sock {
 	struct list_head	list;

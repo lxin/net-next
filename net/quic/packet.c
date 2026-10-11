@@ -10,6 +10,8 @@
  *    Xin Long <lucien.xin@gmail.com>
  */
 
+#include <crypto/utils.h>
+
 #include "socket.h"
 
 #define QUIC_HLEN		1
@@ -429,6 +431,30 @@ static int quic_packet_get_alpn(struct sk_buff *skb, struct quic_data *alpn)
 	}
 	pr_debug("%s: alpn_len: %u\n", __func__, alpn->len);
 	return 0;
+}
+
+static bool quic_packet_addrs_valid(struct sock *sk, struct sk_buff *skb,
+				    bool strict)
+{
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_path_group *paths;
+	union quic_addr *sa, *da;
+
+	quic_get_msg_addrs(skb, &packet->daddr, &packet->saddr);
+
+	if (QUIC_SKB_CB(skb)->seqno != -1) /* Found by addrs; skip checks. */
+		return true;
+
+	if (!strict)
+		return quic_skb_ipv4(skb) ? !ipv6_only_sock(sk) :
+					    !quic_pf_ipv4(sk);
+
+	paths = quic_paths(sk);
+	sa = &packet->saddr;
+	da = &packet->daddr;
+
+	return quic_cmp_sk_addr(sk, quic_path_saddr(paths, 0), da) &&
+	       quic_cmp_sk_addr(sk, quic_path_daddr(paths, 0), sa);
 }
 
 /* Determine the QUIC socket associated with an incoming packet. */
@@ -1072,18 +1098,1036 @@ static int quic_packet_listen_process(struct sock *sk, struct sk_buff *skb,
 	return 0;
 }
 
+static int quic_packet_stateless_reset_process(struct sock *sk,
+					       struct sk_buff *skb, gfp_t gfp)
+{
+	struct quic_conn_id_set *id_set = quic_dest(sk);
+	struct quic_connection_close c = {};
+	u8 *token;
+
+	if (skb->len < QUIC_STATELESS_RESET_MIN_LEN)
+		return -EINVAL;
+
+	/* rfc9000#section-10.3.1:
+	 *
+	 * An endpoint detects a potential Stateless Reset using the trailing
+	 * 16 bytes of the UDP datagram. An endpoint remembers all stateless
+	 * reset tokens associated with the connection IDs and remote addresses
+	 * for datagrams it has recently sent. This includes Stateless Reset
+	 * Token field values from NEW_CONNECTION_ID frames and the server's
+	 * transport parameters but excludes stateless reset tokens associated
+	 * with connection IDs that are either unused or retired. The endpoint
+	 * identifies a received datagram as a Stateless Reset by comparing the
+	 * last 16 bytes of the datagram with all stateless reset tokens
+	 * associated with the remote address on which the datagram was
+	 * received.
+	 */
+	token = skb->data + skb->len - QUIC_CONN_ID_TOKEN_LEN;
+	if (!quic_conn_id_token_exists(id_set, token))
+		return -EINVAL;
+
+	/* rfc9000#section-10.3:
+	 *
+	 * To support this process, an endpoint issues a stateless reset token,
+	 * which is a 16-byte value that is hard to guess. If the peer
+	 * subsequently receives a Stateless Reset, which is a UDP datagram
+	 * that ends in that stateless reset token, the peer will immediately
+	 * end the connection.
+	 */
+	c.errcode = QUIC_TRANSPORT_ERROR_CRYPTO;
+	quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_CLOSE, &c, sizeof(c),
+			    gfp);
+	quic_set_state(sk, QUIC_SS_CLOSED);
+	consume_skb(skb);
+	pr_debug("%s: peer reset\n", __func__);
+	return 0;
+}
+
+static int quic_packet_retry_process(struct sock *sk, struct sk_buff *skb)
+{
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_conn_id *active;
+	u8 *p, tag[QUIC_TAG_LEN];
+	u32 hlen, len, version;
+	gfp_t gfp = GFP_KERNEL;
+	int err;
+
+	/* rfc9000#section-17.2.5.1:
+	 *
+	 * A client MUST discard a Retry packet that contains a Source
+	 * Connection ID field that is identical to the Destination Connection
+	 * ID field of its Initial packet.
+	 */
+	active = quic_conn_id_active(quic_dest(sk));
+	if (active->len == packet->scid.len &&
+	    !memcmp(active->data, packet->scid.data, active->len)) {
+		err = -EINVAL;
+		goto err;
+	}
+	/* rfc9000#section-17.2.5.2:
+	 *
+	 * A client MUST accept and process at most one Retry packet for each
+	 * connection attempt. After the client has received and processed an
+	 * Initial or Retry packet from the server, it MUST discard any
+	 * subsequent Retry packets that it receives.
+	 */
+	if (paths->ampl_rcvlen || paths->retry) {
+		err = -EINVAL;
+		goto err;
+	}
+
+	hlen = QUIC_LONG_HLEN(&packet->dcid, &packet->scid);
+	len = skb->len - hlen;
+	if (len < QUIC_TAG_LEN) {
+		err = -EINVAL;
+		goto err;
+	}
+	p = skb->data + hlen;
+	version = packet->version;
+	/* rfc9000#section-17.2.5.2:
+	 *
+	 * Clients MUST discard Retry packets that have a Retry Integrity Tag
+	 * that cannot be validated.
+	 */
+	err = quic_crypto_get_retry_tag(crypto, skb, &paths->orig_dcid, version,
+					tag);
+	if (err)
+		goto err;
+	if (crypto_memneq(tag, p + len - QUIC_TAG_LEN, QUIC_TAG_LEN)) {
+		err = -EINVAL;
+		goto err;
+	}
+	/* Save the Retry token into quic_token(). */
+	err = quic_data_dup(quic_token(sk), p, len - QUIC_TAG_LEN, gfp);
+	if (err)
+		goto err;
+	/* Update crypto keys with new DCID (like version negotiation). */
+	err = quic_packet_version_change(sk, &packet->scid, version);
+	if (err)
+		goto err;
+	/* rfc9000#section-17.2.5.2:
+	 *
+	 * A client sets the Destination Connection ID field of this Initial
+	 * packet to the value from the Source Connection ID field in the Retry
+	 * packet.
+	 */
+	quic_conn_id_update(active, packet->scid.data, packet->scid.len);
+	/* rfc9000#section-7.3:
+	 *
+	 * If it sends a Retry packet, a server also includes the Source
+	 * Connection ID field from the Retry packet in the
+	 * retry_source_connection_id transport parameter.
+	 *
+	 * (Save conn ID for authenticating this transport parameter later).
+	 */
+	paths->retry = 1;
+	paths->retry_dcid = *active;
+	/* rfc9000#section-17.2.5.2:
+	 *
+	 * The client responds to a Retry packet with an Initial packet that
+	 * includes the provided Retry token to continue connection
+	 * establishment.
+	 *
+	 * (Retransmit CRYPTO in Initial packet, save token in quic_token()).
+	 */
+	quic_outq_retransmit_mark(sk, QUIC_CRYPTO_INITIAL, true);
+	quic_outq_update_loss_timer(sk);
+	quic_outq_transmit(sk, gfp);
+
+	consume_skb(skb);
+	return 0;
+err:
+	kfree_skb(skb);
+	return err;
+}
+
+static int quic_packet_version_process(struct sock *sk, struct sk_buff *skb)
+{
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	u64 version, best = 0;
+	u32 hlen, len;
+	int err;
+	u8 *p;
+
+	/* rfc9000#section-6.2:
+	 *
+	 * A client MUST discard any Version Negotiation packet if it has
+	 * received and successfully processed any other packet, including an
+	 * earlier Version Negotiation packet.
+	 */
+	if (paths->ampl_rcvlen || paths->retry || paths->version) {
+		err = -EINVAL;
+		goto err;
+	}
+	/* rfc9000#section-17.2.1:
+	 *
+	 * The value for Source Connection ID MUST be copied from the
+	 * Destination Connection ID of the received packet, which is initially
+	 * randomly selected by a client.
+	 */
+	if (quic_conn_id_cmp(&paths->orig_dcid, &packet->scid)) {
+		err = -EINVAL;
+		goto err;
+	}
+	hlen = QUIC_LONG_HLEN(&packet->dcid, &packet->scid);
+	len = skb->len - hlen;
+	if (len < QUIC_VERSION_LEN) {
+		err = -EINVAL;
+		goto err;
+	}
+
+	/* rfc9368#section-2.1:
+	 *
+	 * Upon receiving the Version Negotiation packet, the client SHALL
+	 * search for a version it supports in the list provided by the server.
+	 */
+	p = skb->data + hlen;
+	while (len >= QUIC_VERSION_LEN) {
+		/* Parse all versions and choose the highest one. */
+		quic_get_int(&p, &len, &version, QUIC_VERSION_LEN);
+		if (quic_packet_compatible_versions(version) && best < version)
+			best = version;
+		/* A client MUST discard a Version Negotiation packet that lists
+		 * the QUIC version selected by the client.
+		 */
+		if (packet->version == version) {
+			err = -EINVAL;
+			goto err;
+		}
+	}
+	if (best) {
+		/* Found one and update crypto keys using the new version. */
+		err = quic_packet_version_change(sk, &packet->scid, best);
+		if (err)
+			goto err;
+		/* Retransmit CRYPTO in Initial packet with new version. */
+		quic_outq_retransmit_mark(sk, QUIC_CRYPTO_INITIAL, true);
+		quic_outq_update_loss_timer(sk);
+		quic_outq_transmit(sk, GFP_KERNEL);
+		paths->version = 1;
+	}
+
+	consume_skb(skb);
+	return 0;
+err:
+	kfree_skb(skb);
+	return err;
+}
+
+void quic_packet_flush_rxq(struct sock *sk)
+{
+	struct sk_buff_head *head;
+	struct sk_buff *skb;
+
+	head = &sk->sk_receive_queue;
+	if (quic_is_closed(sk)) { /* Drop pending SKBs if socket closed. */
+		__skb_queue_purge(head);
+		return;
+	}
+
+	while ((skb = __skb_dequeue(head)) != NULL) {
+		/* Mark SKB decrypted before processing. */
+		QUIC_SKB_CB(skb)->resume = 1;
+		QUIC_SKB_CB(skb)->backlog = 0;
+		quic_packet_process(sk, skb, GFP_ATOMIC);
+	}
+}
+
+static void quic_packet_decrypt_done(struct sk_buff *skb)
+{
+	struct sock *sk = skb->sk;
+
+	sock_hold(sk);
+	local_bh_disable();
+	bh_lock_sock(sk);
+	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	if (sock_owned_by_user(sk)) {
+		if (!test_and_set_bit(QUIC_RXQ_DEFERRED, &sk->sk_tsq_flags))
+			sock_hold(sk);
+		goto out;
+	}
+
+	quic_packet_flush_rxq(sk);
+out:
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	sock_put(sk);
+}
+
+static int quic_packet_process_error(struct sock *sk, struct sk_buff *skb,
+				     int err)
+{
+	struct quic_outqueue *outq = quic_outq(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	int ret;
+
+	if (!err) /* Invoked from backlog scheduling path. */
+		goto send;
+
+	if (err == -EINPROGRESS) /* Async decryption or already consumed. */
+		return err;
+
+	pr_debug("%s: failed, num: %llu, level: %d, err: %d\n",
+		 __func__, cb->number, cb->level, err);
+
+	/* Do not generate a CONNECTION_CLOSE if the error is non-fatal (no
+	 * transport errcode set), or a close is already pending.
+	 */
+	if (!cb->errcode || outq->close_pending) {
+		kfree_skb(skb);
+		return err;
+	}
+
+	/* Schedule packet processing in backlog context so the CONNECTION_CLOSE
+	 * can be sent from a safe/process context.
+	 */
+	ret = quic_packet_deferred_schedule(skb);
+	if (ret) {
+		if (ret > 0) /* Mark it only if scheduling succeeded. */
+			outq->close_pending = 1;
+		return err;
+	}
+
+send:
+	quic_outq_transmit_close(sk, cb->errframe, cb->errcode, cb->level);
+	kfree_skb(skb);
+	return err;
+}
+
+static int quic_packet_backlog_tail(struct sock *sk, struct sk_buff *skb)
+{
+	int len = skb->truesize;
+
+	if (sk_rmem_alloc_get(sk) + len > sk->sk_rcvbuf ||
+	    !__sk_rmem_schedule(sk, len, false)) {
+		QUIC_INC_STATS(sock_net(sk), QUIC_MIB_PKT_RCVDROP);
+		kfree_skb(skb);
+		return -ENOBUFS;
+	}
+	QUIC_SKB_CB(skb)->backlog = 1;
+	skb_set_owner_r(skb, sk);
+	__skb_queue_tail(&quic_packet(sk)->backlog_list, skb);
+	return 0;
+}
+
+/* Process the header of an incoming long-header QUIC handshake packet. Parses
+ * the packet type and handles Version Negotiation and Retry if present. Returns
+ * -EINPROGRESS if the packet has been consumed or queued for later processing.
+ */
+static int quic_packet_handshake_header_process(struct sock *sk,
+						struct sk_buff *skb, gfp_t gfp)
+{
+	u8 *p = (u8 *)quic_hshdr(skb), type = quic_hshdr(skb)->type;
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	bool is_serv = quic_is_serv(sk);
+	u32 len = skb->len, version;
+	struct quic_data token;
+	u64 length;
+	int err;
+
+	quic_packet_reset(packet); /* Reset packet for new parsing. */
+	/* Read VERSION, Destination Connection ID and Source Connection ID. */
+	err = quic_packet_get_long_header(&packet->dcid, &packet->scid,
+					  &version, &p, &len);
+	if (err)
+		return err;
+	if (!version) { /* Version == 0 means a Version Negotiation packet. */
+		if (is_serv)
+			return -EINVAL;
+		if (!quic_packet_deferred_schedule(skb))
+			quic_packet_version_process(sk, skb);
+		return -EINPROGRESS;
+	}
+	/* Read Packet Type. */
+	type = quic_packet_version_get_type(version, type);
+	if (version != packet->version) {
+		/* Version negotiation is already complete on this non-listen
+		 * socket; skip the packet if the negotiated version is
+		 * unsupported.
+		 */
+		if (type != QUIC_PACKET_INITIAL ||
+		    !quic_packet_compatible_versions(version))
+			return -EINVAL;
+		if (quic_packet_deferred_schedule(skb))
+			return -EINPROGRESS;
+		/* Update crypto keys for the new negotiated version. */
+		err = quic_packet_version_change(sk, &quic_paths(sk)->orig_dcid,
+						 version);
+		if (err)
+			return err;
+	}
+	switch (type) {
+	case QUIC_PACKET_INITIAL:
+		if (!quic_crypto(sk, QUIC_CRYPTO_INITIAL)->recv_ready)
+			return -EINVAL;
+		err = quic_packet_get_token(&token, &p, &len); /* Read Token. */
+		if (err)
+			return err;
+		packet->level = QUIC_CRYPTO_INITIAL;
+		if (!is_serv && token.len) {
+			/* rfc9000#section-17.2.2:
+			 *
+			 * Initial packets sent by the server MUST set the
+			 * Token Length field to 0; clients that receive an
+			 * Initial packet with a non-zero Token Length field
+			 * MUST either discard the packet or generate a
+			 * connection error of type PROTOCOL_VIOLATION.
+			 */
+			cb->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+			return -EINVAL;
+		}
+		break;
+	case QUIC_PACKET_HANDSHAKE:
+		if (!quic_crypto(sk, QUIC_CRYPTO_HANDSHAKE)->recv_ready) {
+			if (quic_is_established(sk))
+				return -EINVAL;
+			/* Queue to backlog until Handshake keys are ready. */
+			quic_packet_backlog_tail(sk, skb);
+			return -EINPROGRESS;
+		}
+		packet->level = QUIC_CRYPTO_HANDSHAKE;
+		break;
+	case QUIC_PACKET_0RTT:
+		if (!is_serv)
+			return -EINVAL;
+		if (!quic_crypto(sk, QUIC_CRYPTO_EARLY)->recv_ready) {
+			if (quic_is_established(sk))
+				return -EINVAL;
+			/* Queue to backlog until 0-RTT keys are ready. */
+			quic_packet_backlog_tail(sk, skb);
+			return -EINPROGRESS;
+		}
+		packet->level = QUIC_CRYPTO_EARLY;
+		break;
+	case QUIC_PACKET_RETRY:
+		if (is_serv)
+			return -EINVAL;
+		if (!quic_packet_deferred_schedule(skb))
+			quic_packet_retry_process(sk, skb); /* Handle Retry. */
+		return -EINPROGRESS;
+	default:
+		return -EINVAL;
+	}
+
+	/* Read Payload Length. */
+	if (!quic_get_var(&p, &len, &length) || length > (u64)len)
+		return -EINVAL;
+	cb->length = (u16)length;
+	cb->number_offset = (u16)(p - skb->data);
+	return 0;
+}
+
+/* Process an incoming long-header QUIC packet during the handshake phase. This
+ * packet may be a coalesced packet, including multiple long headers and a
+ * trailing short header.
+ */
 static int quic_packet_handshake_process(struct sock *sk, struct sk_buff *skb,
 					 gfp_t gfp)
 {
-	kfree_skb(skb);
-	return -EOPNOTSUPP;
+	bool ack_eliciting = false, ack_immediate = false;
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	struct quic_inqueue *inq = quic_inq(sk);
+	struct quic_cong *cong = quic_cong(sk);
+	bool is_serv = quic_is_serv(sk);
+	struct net *net = sock_net(sk);
+	struct quic_conn_id *conn_id;
+	struct quic_frame frame = {};
+	struct quic_crypto *crypto;
+	struct quic_pnspace *space;
+	struct udphdr *uh;
+	int err = 0;
+
+	if (cb->errcode) /* Re-entered after backlog scheduling. */
+		return quic_packet_process_error(sk, skb, err);
+
+	if (!quic_packet_addrs_valid(sk, skb, true)) {
+		kfree_skb(skb);
+		return -EINVAL;
+	}
+
+	/* Associate skb with sk to ensure sk is valid during async decryption
+	 * completion.
+	 */
+	WARN_ON_ONCE(!skb_set_owner_sk_safe(skb, sk));
+	sock_rps_save_rxhash(sk, skb);
+
+	/* Loop to handle each QUIC packet in this coalesced packet. */
+	while (skb->len > 0) {
+		if (quic_hshdr(skb)->form == QUIC_PACKET_FORM_SHORT) {
+			/* If DCID doesn't match treat as padding, and increase
+			 * anti-amplification credit if path isn't validated.
+			 */
+			conn_id = &packet->dcid;
+			if (skb->len < QUIC_HLEN + QUIC_CONN_ID_DEF_LEN ||
+			    conn_id->len != QUIC_CONN_ID_DEF_LEN ||
+			    memcmp(conn_id->data, skb->data + QUIC_HLEN,
+				   conn_id->len)) {
+				if (!paths->validated)
+					paths->ampl_rcvlen += skb->len;
+				break;
+			}
+			/* Handle short-header packet via
+			 * quic_packet_app_process().
+			 */
+			cb->number_offset = 0;
+			quic_packet_process(sk, skb, gfp);
+			skb = NULL;
+			break;
+		}
+		/* Parse long-header and handle Retry or Version Negotiation if
+		 * present.
+		 */
+		err = quic_packet_handshake_header_process(sk, skb, gfp);
+		if (err) {
+			if (err != -EINPROGRESS) {
+				QUIC_INC_STATS(net, QUIC_MIB_PKT_INVHDRDROP);
+				cb->level = packet->level;
+			}
+			break;
+		}
+
+		cb->level = packet->level;
+		crypto = quic_crypto(sk, cb->level);
+		space = quic_pnspace(sk, cb->level);
+
+		/* Set highest received PN for PN decode during decryption. */
+		cb->number = space->max_pn_seen;
+		cb->crypto_done = quic_packet_decrypt_done;
+		err = quic_crypto_decrypt(crypto, skb, gfp);
+		if (err) {
+			if (err == -EKEYEXPIRED) {
+				cb->errcode =
+					QUIC_TRANSPORT_ERROR_AEAD_LIMIT_REACHED;
+				break;
+			}
+			if (err == -EINPROGRESS) {
+				QUIC_INC_STATS(net, QUIC_MIB_PKT_DECBACKLOGS);
+				break;
+			}
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_DECDROP);
+			break;
+		}
+		if (!cb->resume) /* Already decrypted (parse_alpn or async). */
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_DECFASTPATHS);
+		if (quic_hshdr(skb)->reserved) {
+			/* rfc9000#section-17.2:
+			 *
+			 * An endpoint MUST treat receipt of a packet that has
+			 * a non-zero value for these bits after removing both
+			 * packet and header protection as a connection error
+			 * of type PROTOCOL_VIOLATION.
+			 */
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_INVHDRDROP);
+			cb->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+			err = -EINVAL;
+			break;
+		}
+
+		pr_debug("%s: recvd, num: %llu, level: %d, len: %d\n",
+			 __func__, cb->number, cb->level, skb->len);
+
+		/* Use packet arrival time as current (may be from backlog). */
+		space->time = cb->time;
+		cong->time = cb->time;
+		err = quic_pnspace_check(space, cb->number);
+		if (err) {
+			if (err > 0) { /* ACK if PN already marked. */
+				packet->ack_eliciting = 1;
+				err = 0;
+				goto skip;
+			}
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_INVNUMDROP);
+			break;
+		}
+
+		/* Prepare a 'coalesced' frame for parsing and processing. */
+		frame.data = skb->data + cb->number_offset + cb->number_len;
+		frame.len = cb->length - cb->number_len -
+			    quic_packet_taglen(packet);
+		frame.level = cb->level;
+		frame.skb = skb;
+		/* Process this 'coalesced' frame. */
+		err = quic_frame_process(sk, &frame, gfp);
+		if (err) {
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_INVFRMDROP);
+			break;
+		}
+		/* Mark packet number as received for ACK generation. */
+		err = quic_pnspace_mark(space, cb->number, gfp);
+		if (err)
+			break;
+
+		/* rfc9000#section-13.4.1:
+		 *
+		 * On receiving an IP packet with an ECT(0), ECT(1), or ECN-CE
+		 * codepoint, an ECN-enabled endpoint accesses the ECN field
+		 * and increases the corresponding ECT(0), ECT(1), or ECN-CE
+		 * count. These ECN counts are included in subsequent ACK
+		 * frames.
+		 */
+		quic_pnspace_inc_ecn_local(space, quic_get_msg_ecn(skb));
+
+		if (paths->validated)
+			goto skip;
+
+		/* Increase anti-amplification credit if not validated. */
+		paths->ampl_rcvlen += cb->number_offset + cb->length;
+		if (cb->level == QUIC_CRYPTO_HANDSHAKE) {
+			/* rfc9000#section-8.1:
+			 *
+			 * Once an endpoint has successfully processed a
+			 * Handshake packet from the peer, it can consider the
+			 * peer address to have been validated.
+			 *
+			 * On the server this is PeerCompletedAddressValidation
+			 * (rfc9002#appendix-A.8), so set validated here.  On
+			 * the client, PeerCompletedAddressValidation requires a
+			 * Handshake ACK or handshake confirmation, so validated
+			 * is set when has_sack or on HANDSHAKE_DONE.
+			 *
+			 * Clean up transmitted initial packets on both sides.
+			 */
+			if (quic_is_serv(sk) || packet->has_sack)
+				paths->validated = 1;
+			quic_outq_transmitted_sack(sk, QUIC_CRYPTO_INITIAL,
+						   QUIC_PN_MAX, 0, -1, 0, NULL,
+						   gfp);
+			quic_crypto_discard(quic_crypto(sk,
+							QUIC_CRYPTO_INITIAL));
+		}
+
+skip:
+		if (packet->has_sack) {
+			/* rfc9002#section-6:
+			 *
+			 * QUIC senders use acknowledgments to detect lost
+			 * packets and a PTO to ensure acknowledgments are
+			 * received.
+			 */
+			quic_outq_retransmit_mark(sk, cb->level, false);
+			quic_outq_update_loss_timer(sk);
+		}
+		cb->resume = 0; /* Clear resume for next decryption */
+		/* Reset to mark header decryption incomplete. */
+		cb->number_len = 0;
+		if (!packet->ack_eliciting)
+			goto next; /* No ACK-eliciting frame: skip ACK. */
+
+		if (packet->ack_immediate || cb->number < space->max_pn_seen)
+			ack_immediate = true;
+
+		/* On server, don't arm ACK timer for Initial; next handshake
+		 * msg can bundle the ACK.
+		 */
+		space->need_sack = 1; /* ACK needed for this packet space. */
+		if (cb->level != QUIC_CRYPTO_INITIAL) {
+			ack_eliciting = true;
+			goto next;
+		}
+
+		if (!is_serv) {
+			ack_eliciting = true;
+			/* rfc9000#section-7.2
+			 *
+			 * After processing the first Initial packet, each
+			 * endpoint sets the Destination Connection ID field in
+			 * subsequent packets it sends to the value of the
+			 * Source Connection ID field that it received.
+			 *
+			 * (Server sets it when creating the accept socket in
+			 *  accept()).
+			 */
+			conn_id = quic_conn_id_active(quic_dest(sk));
+			quic_conn_id_update(conn_id, packet->scid.data,
+					    packet->scid.len);
+			goto next;
+		}
+		/* rfc9000#section-14.1:
+		 *
+		 * A server MUST discard an Initial packet that is carried in a
+		 * UDP datagram with a payload that is smaller than the
+		 * smallest allowed maximum datagram size of 1200 bytes. A
+		 * server MAY also immediately close the connection by sending
+		 * a CONNECTION_CLOSE frame with an error code of
+		 * PROTOCOL_VIOLATION.
+		 */
+		uh = udp_hdr(skb);
+		if (ntohs(uh->len) < sizeof(*uh) + QUIC_MIN_UDP_PAYLOAD) {
+			cb->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+			err = -EINVAL;
+			break;
+		}
+next:
+		/* Advance skb pointer to next QUIC packet. */
+		skb_pull(skb, cb->number_offset + cb->length);
+	}
+	if (paths->blocked) {
+		/* The path was previously blocked due to the
+		 * anti-amplification limit. Now that additional credit may be
+		 * available, unblock the path and update the loss timer to
+		 * allow transmission of pending frames.
+		 */
+		paths->blocked = 0;
+		quic_outq_update_loss_timer(sk);
+	}
+	if (ack_immediate) {
+		quic_outq_transmit(sk, gfp);
+		goto out;
+	}
+	if (inq->sack_flag == QUIC_SACK_FLAG_NONE && ack_eliciting) {
+		/* ACKs are not sent immediately, as they are typically bundled
+		 * with other TLS messages from userspace. If userspace doesn't
+		 * send anything, start the ack_delay timer to ensure ACKs are
+		 * eventually transmitted.
+		 */
+		quic_timer_reset(sk, QUIC_TIMER_SACK, inq->max_ack_delay);
+		inq->sack_flag = QUIC_SACK_FLAG_XMIT;
+	}
+out:
+	quic_timer_reset(sk, QUIC_TIMER_PATH, paths->keepalive_interval);
+
+	if (err)
+		return quic_packet_process_error(sk, skb, err);
+	consume_skb(skb);
+	return 0;
 }
 
+/* Check if the packet arrived on an alternate path. If so and no alternate
+ * connection ID is available, sends a RETIRE_CONNECTION_ID frame to request a
+ * new one.
+ */
+static int quic_packet_path_alt_detect(struct sock *sk, struct sk_buff *skb,
+				       gfp_t gfp)
+{
+	struct quic_conn_id_set *source = quic_source(sk);
+	struct quic_conn_id_set *dest = quic_dest(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	u64 seqno;
+
+	/* Detect alternate path if migration occurred. */
+	cb->path = quic_path_detect_alt(quic_paths(sk), &packet->daddr,
+					&packet->saddr, sk);
+	if (!cb->path ||
+	    quic_conn_id_select_alt(dest, cb->seqno == source->active->number))
+		return 0;
+
+	/* Send RETIRE_CONNECTION_ID frame to request a new dest connection ID
+	 * if no alternative one.
+	 */
+	seqno = quic_conn_id_first_number(dest);
+	quic_outq_transmit_frame(sk, QUIC_FRAME_RETIRE_CONNECTION_ID, &seqno, 0,
+				 false, gfp);
+	return -EAGAIN;
+}
+
+/* Process detected connection migration. Either initiate probing on a newly
+ * discovered alternate path or finalize migration if new path is now active.
+ */
+static void quic_packet_path_alt_process(struct sock *sk, struct sk_buff *skb,
+					 gfp_t gfp)
+{
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+
+	if (cb->path) {
+		/* Start path probe for connection migration if an alternate
+		 * path is detected and connection migration has not yet been
+		 * initiated.
+		 */
+		if (quic_path_alt_state(paths, QUIC_PATH_ALT_NONE))
+			quic_outq_probe_path_alt(sk, true, gfp);
+		return;
+	}
+
+	if (!quic_packet(sk)->non_probing ||
+	    !quic_path_alt_state(paths, QUIC_PATH_ALT_SWAPPED))
+		return;
+
+	/* Connection migration is complete: free old path resources if this is
+	 * a non-probing, highest-numbered received packet after the new path
+	 * was successfully swapped in as active.
+	 */
+	quic_path_unbind(sk, paths, 1);
+	quic_conn_id_set_alt(quic_dest(sk), NULL);
+	/* Update the active source connection ID after connection migration.
+	 * This ID is not used in 1-RTT packets but is tracked to detect
+	 * changes in the destination connection ID of incoming packets. If the
+	 * ID remains the same, it likely indicates a NAT rebinding rather than
+	 * a true migration, and there's no need to use a new connection ID for
+	 * the new path.
+	 */
+	quic_conn_id_update_active(quic_source(sk), cb->seqno);
+}
+
+/* Final processing steps for a 1-RTT QUIC packet. */
+static int quic_packet_app_process_done(struct sock *sk, struct sk_buff *skb,
+					gfp_t gfp)
+{
+	struct quic_pnspace *space = quic_pnspace(sk, QUIC_CRYPTO_APP);
+	struct quic_stream_table *streams = quic_streams(sk);
+	struct quic_path_group *paths = quic_paths(sk);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	struct quic_inqueue *inq = quic_inq(sk);
+	s64 max_bidi, max_uni;
+	u8 frame;
+
+	/* Only process migration on the latest PN seen. */
+	if (cb->number == space->max_pn_seen)
+		quic_packet_path_alt_process(sk, skb, gfp);
+
+	if (packet->has_sack) {
+		/* rfc9002#section-6:
+		 *
+		 * QUIC senders use acknowledgments to detect lost packets and
+		 * a PTO to ensure acknowledgments are received.
+		 */
+		quic_outq_retransmit_mark(sk, QUIC_CRYPTO_APP, false);
+		quic_outq_update_loss_timer(sk);
+	}
+
+	if (quic_stream_max_streams_update(streams, &max_uni, &max_bidi)) {
+		/* Stream limits changed: advertise updated credits. */
+		if (max_uni) {
+			frame = QUIC_FRAME_MAX_STREAMS_UNI;
+			quic_outq_transmit_frame(sk, frame, &max_uni, 0, true,
+						 gfp);
+		}
+		if (max_bidi) {
+			frame = QUIC_FRAME_MAX_STREAMS_BIDI;
+			quic_outq_transmit_frame(sk, frame, &max_bidi, 0, true,
+						 gfp);
+		}
+	}
+
+	if (!packet->ack_eliciting)
+		goto out; /* No ACK-eliciting frame: skip ACK. */
+
+	if (packet->ack_immediate || cb->number < space->max_pn_seen ||
+	    cb->path) {
+		space->need_sack = 1; /* ACK needed for this packet space. */
+		space->sack_path = cb->path; /* ACK on same path as packet. */
+		space->sack_pending = 0;
+		goto out;
+	}
+
+	/* Start ack delay timer to generate ACK frames on 1-RTT level then
+	 * transmit all pending ACKs.
+	 */
+	if (inq->sack_flag == QUIC_SACK_FLAG_NONE)
+		quic_timer_reset(sk, QUIC_TIMER_SACK, inq->max_ack_delay);
+	inq->sack_flag = QUIC_SACK_FLAG_APP;
+	space->sack_pending = 1;
+
+out:
+	if (quic_is_established(sk)) {
+		/* If connection is established, send ACKs immediately.  Reuse
+		 * ack_delay as an idle timer.
+		 */
+		if (inq->sack_flag == QUIC_SACK_FLAG_NONE)
+			quic_timer_reset(sk, QUIC_TIMER_IDLE, inq->timeout);
+		quic_outq_transmit(sk, gfp);
+	} else if (inq->sack_flag == QUIC_SACK_FLAG_NONE) {
+		/* If not yet established, ACKs are not sent immediately, as
+		 * they are typically bundled with other TLS messages from
+		 * userspace. If userspace doesn't send anything, start the
+		 * ack_delay timer to ensure ACKs are eventually transmitted.
+		 */
+		inq->sack_flag = QUIC_SACK_FLAG_XMIT;
+		quic_timer_reset(sk, QUIC_TIMER_SACK, inq->max_ack_delay);
+	}
+	/* Shared path timer: keepalive when not ALT probing. */
+	if (!quic_path_alt_state(paths, QUIC_PATH_ALT_PROBING))
+		quic_timer_reset(sk, QUIC_TIMER_PATH,
+				 paths->keepalive_interval);
+	consume_skb(skb);
+	return 0;
+}
+
+/* Process an incoming 1-RTT packet. */
 static int quic_packet_app_process(struct sock *sk, struct sk_buff *skb,
 				   gfp_t gfp)
 {
-	kfree_skb(skb);
-	return -EOPNOTSUPP;
+	struct quic_pnspace *space = quic_pnspace(sk, QUIC_CRYPTO_APP);
+	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_APP);
+	struct quic_packet *packet = quic_packet(sk);
+	struct quic_skb_cb *cb = QUIC_SKB_CB(skb);
+	struct net *net = sock_net(sk);
+	struct quic_frame frame = {};
+	u8 taglen, key_phase;
+	int err = 0;
+
+	if (cb->errcode) /* Re-entered after backlog scheduling. */
+		goto err;
+
+	if (!quic_packet_addrs_valid(sk, skb, false)) {
+		kfree_skb(skb);
+		return -EINVAL;
+	}
+
+	sock_rps_save_rxhash(sk, skb);
+
+	quic_packet_reset(packet); /* Reset packet for new parsing. */
+	if (!quic_hdr(skb)->fixed && !quic_inq(sk)->grease_quic_bit) {
+		/* rfc9000#section-17.3.1:
+		 *
+		 * Packets containing a zero value for this bit are not valid
+		 * packets in this version and MUST be discarded.
+		 *
+		 * rfc9287#section-3:
+		 *
+		 * An endpoint that advertises the grease_quic_bit transport
+		 * parameter MUST accept packets with the QUIC Bit set to a
+		 * value of 0.
+		 */
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_INVHDRDROP);
+		err = -EINVAL;
+		goto err;
+	}
+
+	if (cb->seqno == -1) {
+		/* No valid matched connection ID was found, so treat this as a
+		 * potential stateless reset packet.
+		 */
+		err = quic_packet_stateless_reset_process(sk, skb, gfp);
+		if (err)
+			goto err;
+		return 0;
+	}
+
+	if (!crypto->recv_ready) {
+		/* Queue to backlog until 1-RTT keys are ready. */
+		quic_packet_backlog_tail(sk, skb);
+		return 0;
+	}
+	/* Calculate Payload Length. */
+	cb->number_offset = QUIC_CONN_ID_DEF_LEN + QUIC_HLEN;
+	cb->length = (u16)(skb->len - cb->number_offset);
+
+	/* draft-banks-quic-disable-encryption#section-2.1:
+	 *
+	 * Advertising the disable_1rtt_encryption transport parameter
+	 * indicates that the endpoint wishes to disable encryption for 1-RTT
+	 * packets.  If successfully negotiated, all packets that would
+	 * normally be encrypted with the 1-RTT key are instead sent as
+	 * cleartext; both header and packet protections are disabled.
+	 */
+	taglen = quic_packet_taglen(packet);
+	if (!taglen) { /* Indicates disable_1rtt_encryption was negotiated. */
+		cb->number_len = quic_hdr(skb)->pnl + 1;
+		cb->resume = 1;
+	}
+	/* Associate skb with sk to ensure sk is valid during async decryption
+	 * completion.
+	 */
+	WARN_ON_ONCE(!skb_set_owner_sk_safe(skb, sk));
+
+	/* Set highest received PN for PN decode during decryption if packet
+	 * number will be reconstructed in quic_crypto_decrypt().
+	 */
+	if (cb->resume || !cb->number_len)
+		cb->number = space->max_pn_seen;
+	cb->crypto_done = quic_packet_decrypt_done;
+	err = quic_crypto_decrypt(crypto, skb, gfp);
+	if (err) {
+		if (err == -EKEYEXPIRED) {
+			cb->errcode = QUIC_TRANSPORT_ERROR_AEAD_LIMIT_REACHED;
+			goto err;
+		}
+		if (err == -EINPROGRESS) {
+			QUIC_INC_STATS(net, QUIC_MIB_PKT_DECBACKLOGS);
+			return err;
+		}
+		if (err == -EKEYREVOKED) {
+			quic_packet_deferred_schedule(skb);
+			return err;
+		}
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_DECDROP);
+		goto err;
+	}
+	if (cb->key_update) {
+		/* Notify application of the key update with new key phase. */
+		key_phase = cb->key_phase;
+		quic_inq_event_recv(sk, QUIC_EVENT_KEY_UPDATE, &key_phase,
+				    sizeof(key_phase), gfp);
+	}
+	if (!cb->resume) /* No decryption (disabled 1-RTT or async).*/
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_DECFASTPATHS);
+	if (quic_hdr(skb)->reserved) {
+		/* rfc9000#section-17.2:
+		 *
+		 * An endpoint MUST treat receipt of a packet that has a
+		 * non-zero value for these bits after removing both packet and
+		 * header protection as a connection error of type
+		 * PROTOCOL_VIOLATION.
+		 */
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_INVHDRDROP);
+		cb->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+		err = -EINVAL;
+		goto err;
+	}
+
+	pr_debug("%s: recvd, num: %llu, len: %d\n", __func__, cb->number,
+		 skb->len);
+
+	/* Use packet arrival time as current (may be from backlog). */
+	space->time = cb->time;
+	quic_cong(sk)->time = cb->time;
+	err = quic_pnspace_check(space, cb->number);
+	if (err) {
+		if (err > 0) { /* ACK if PN already marked. */
+			packet->ack_eliciting = 1;
+			goto out;
+		}
+		/* Drop if packet number is outside ACK tracking range. */
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_INVNUMDROP);
+		goto err;
+	}
+
+	if (cb->number >= space->max_pn_seen) {
+		/* Only detect migration on the latest PN seen. */
+		err = quic_packet_path_alt_detect(sk, skb, gfp);
+		if (err)
+			goto err;
+	}
+
+	/* Prepare a 'coalesced' frame for parsing and processing. */
+	frame.data = skb->data + cb->number_offset + cb->number_len;
+	frame.len = cb->length - cb->number_len - taglen;
+	frame.path = cb->path;
+	frame.skb = skb;
+	/* Process this 'coalesced' frame. */
+	err = quic_frame_process(sk, &frame, gfp);
+	if (err) {
+		QUIC_INC_STATS(net, QUIC_MIB_PKT_INVFRMDROP);
+		goto err;
+	}
+	/* Mark packet number as received for ACK generation. */
+	err = quic_pnspace_mark(space, cb->number, gfp);
+	if (err)
+		goto err;
+
+	/* rfc9000#section-13.4.1:
+	 *
+	 * On receiving an IP packet with an ECT(0), ECT(1), or ECN-CE
+	 * codepoint, an ECN-enabled endpoint accesses the ECN field and
+	 * increases the corresponding ECT(0), ECT(1), or ECN-CE count. These
+	 * ECN counts are included in subsequent ACK frames.
+	 */
+	quic_pnspace_inc_ecn_local(space, quic_get_msg_ecn(skb));
+
+out:
+	return quic_packet_app_process_done(sk, skb, gfp);
+
+err:
+	return quic_packet_process_error(sk, skb, err);
 }
 
 int quic_packet_process(struct sock *sk, struct sk_buff *skb, gfp_t gfp)

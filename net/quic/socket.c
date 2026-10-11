@@ -636,6 +636,10 @@ static void quic_release_cb(struct sock *sk)
 		quic_packet_flush_txq(sk);
 		__sock_put(sk);
 	}
+	if (flags & QUIC_F_RXQ_DEFERRED) {
+		quic_packet_flush_rxq(sk);
+		__sock_put(sk);
+	}
 }
 
 static int quic_disconnect(struct sock *sk, int flags)
