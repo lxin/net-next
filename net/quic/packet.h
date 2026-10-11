@@ -26,7 +26,6 @@ struct quic_packet {
 	u16 len;       /* QUIC packet length including taglen for sending */
 	u16 mss;       /* MSS including taglen */
 
-	u8 validate_peer_address:1; /* Temporary; will move to quic_outqueue */
 	u8 path_validating:1; /* Packet contains path_validating frames */
 	u8 ack_eliciting:1;   /* Packet contains ack-eliciting frames */
 	u8 ack_immediate:1;   /* Send ACK immediately (skip ack_delay timer) */
@@ -93,10 +92,12 @@ static inline void quic_packet_reset(struct quic_packet *packet)
 }
 
 int quic_packet_process(struct sock *sk, struct sk_buff *skb, gfp_t gfp);
+int quic_packet_tail(struct sock *sk, struct quic_frame *frame);
 u16 quic_packet_overhead(struct sock *sk, u8 level, u8 path);
 int quic_packet_config(struct sock *sk, u8 level, u8 path);
 
 int quic_packet_create_and_xmit(struct sock *sk, gfp_t gfp);
+void quic_packet_flush_txq(struct sock *sk);
 int quic_packet_route(struct sock *sk);
 
 void quic_packet_mss_update(struct sock *sk, u32 mss);
