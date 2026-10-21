@@ -266,6 +266,125 @@ static u8 quic_v6_get_msg_ecn(struct sk_buff *skb)
 	return (ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK);
 }
 
+static int quic_v4_get_user_addr(struct sock *sk, union quic_addr *a,
+				 struct sockaddr *addr, int addr_len, bool bind,
+				 bool any)
+{
+	struct net *net = sock_net(sk);
+	__be32 s_addr;
+	bool is_any;
+	int tb_id;
+
+	if (addr_len < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET)
+		return -EINVAL;
+	s_addr = quic_addr(addr)->v4.sin_addr.s_addr;
+	if (ipv4_is_multicast(s_addr))
+		return -EINVAL;
+	is_any = (s_addr == htonl(INADDR_ANY));
+	if (is_any && !any)
+		return -EINVAL;
+
+	if (bind && !is_any && !inet_can_nonlocal_bind(net, inet_sk(sk))) {
+		tb_id = l3mdev_fib_table_by_index(net, sk->sk_bound_dev_if);
+		if (!tb_id)
+			tb_id = RT_TABLE_LOCAL;
+		if (inet_addr_type_table(net, s_addr, tb_id) != RTN_LOCAL)
+			return -EADDRNOTAVAIL;
+	}
+
+	memcpy(a, addr, offsetof(struct sockaddr_in, __pad));
+	return 0;
+}
+
+static int quic_v6_get_user_addr(struct sock *sk, union quic_addr *a,
+				 struct sockaddr *addr, int addr_len, bool bind,
+				 bool any)
+{
+	u32 len = sizeof(struct sockaddr_in);
+	struct net *net = sock_net(sk);
+	struct net_device *dev = NULL;
+	struct sockaddr_in sin = {};
+	union quic_addr *ua;
+	bool is_any, local;
+	int type;
+
+	if (addr_len < len)
+		return -EINVAL;
+
+	if (addr->sa_family != AF_INET6) {
+		if (ipv6_only_sock(sk))
+			return -EINVAL;
+		return quic_v4_get_user_addr(sk, a, addr, addr_len, bind, any);
+	}
+
+	len = sizeof(struct sockaddr_in6);
+	if (addr_len < len)
+		return -EINVAL;
+	ua = quic_addr(addr);
+	type = ipv6_addr_type(&ua->v6.sin6_addr);
+	if (type == IPV6_ADDR_MAPPED) {
+		if (ipv6_only_sock(sk))
+			return -EINVAL;
+
+		sin.sin_family = AF_INET;
+		sin.sin_port = ua->v6.sin6_port;
+		sin.sin_addr.s_addr = ua->v6.sin6_addr.s6_addr32[3];
+
+		addr_len = sizeof(sin);
+		addr = (struct sockaddr *)&sin;
+		return quic_v4_get_user_addr(sk, a, addr, addr_len, bind, any);
+	}
+	is_any = (type == IPV6_ADDR_ANY);
+	if (!is_any && !(type & IPV6_ADDR_UNICAST))
+		return -EINVAL;
+	if (is_any && !any)
+		return -EINVAL;
+
+	local = (bind && !is_any && !ipv6_can_nonlocal_bind(net, inet_sk(sk)));
+	if (type & IPV6_ADDR_LINKLOCAL) {
+		if (!ua->v6.sin6_scope_id)
+			return -EINVAL;
+
+		rcu_read_lock();
+		dev = dev_get_by_index_rcu(net, ua->v6.sin6_scope_id);
+		if (!dev) {
+			rcu_read_unlock();
+			return -EINVAL;
+		}
+		/* Validate addr ownership if binding without nonlocal_bind. */
+		if (local && !ipv6_chk_addr(net, &ua->v6.sin6_addr, dev, 0)) {
+			rcu_read_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		rcu_read_unlock();
+	} else if (local) {
+		rcu_read_lock();
+		if (sk->sk_bound_dev_if) {
+			dev = dev_get_by_index_rcu(net, sk->sk_bound_dev_if);
+			if (!dev) {
+				rcu_read_unlock();
+				return -EINVAL;
+			}
+		}
+		if (!ipv6_chk_addr(net, &ua->v6.sin6_addr, dev, 0)) {
+			rcu_read_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		rcu_read_unlock();
+	}
+
+	memcpy(a, addr, len);
+
+	/* Clear sin6_flowinfo and sin6_scope_id so listen socket address
+	 * comparison can rely on memcmp() for hashing and lookup.
+	 */
+	if (any)
+		a->v6.sin6_flowinfo = 0;
+	if (!(type & IPV6_ADDR_LINKLOCAL))
+		a->v6.sin6_scope_id = 0;
+	return 0;
+}
+
 static bool quic_v4_cmp_sk_addr(struct sock *sk, union quic_addr *a,
 				union quic_addr *addr)
 {
@@ -443,6 +562,16 @@ u8 quic_get_msg_ecn(struct sk_buff *skb)
 {
 	return quic_skb_ipv4(skb) ? quic_v4_get_msg_ecn(skb) :
 				    quic_v6_get_msg_ecn(skb);
+}
+
+int quic_get_user_addr(struct sock *sk, union quic_addr *a,
+		       struct sockaddr *addr, int addr_len, bool bind,
+		       bool any)
+{
+	memset(a, 0, sizeof(*a));
+	return quic_pf_ipv4(sk) ?
+	       quic_v4_get_user_addr(sk, a, addr, addr_len, bind, any) :
+	       quic_v6_get_user_addr(sk, a, addr, addr_len, bind, any);
 }
 
 bool quic_cmp_sk_addr(struct sock *sk, union quic_addr *a,
