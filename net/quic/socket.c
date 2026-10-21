@@ -358,6 +358,19 @@ static void quic_write_space(struct sock *sk)
 	rcu_read_unlock();
 }
 
+static void quic_sock_apply_transport_param(struct sock *sk,
+					    struct quic_transport_param *p)
+{
+	struct quic_conn_id_set *id_set =
+		p->remote ? quic_source(sk) : quic_dest(sk);
+
+	quic_inq_set_param(sk, p);
+	quic_outq_set_param(sk, p);
+	quic_conn_id_set_param(id_set, p);
+	quic_path_set_param(quic_paths(sk), p);
+	quic_stream_set_param(quic_streams(sk), p, quic_is_serv(sk));
+}
+
 static void quic_crypto_free_work(struct work_struct *w)
 {
 	struct quic_crypto *crypto = container_of(w, struct quic_crypto, work);
@@ -388,6 +401,7 @@ static void quic_sock_destruct(struct sock *sk)
 
 static int quic_init_sock(struct sock *sk)
 {
+	struct quic_transport_param *p = &quic_default_param;
 	struct quic_pnspace *space;
 	struct quic_crypto *crypto;
 	u8 i;
@@ -406,7 +420,10 @@ static int quic_init_sock(struct sock *sk)
 	quic_path_init(quic_paths(sk));
 	quic_cong_init(quic_cong(sk));
 
+	quic_sock_apply_transport_param(sk, p);
+
 	quic_outq_init(sk);
+	quic_inq_init(sk);
 	quic_timer_init(sk);
 	quic_packet_init(sk);
 
@@ -443,6 +460,7 @@ static void quic_destroy_sock(struct sock *sk)
 	u8 i;
 
 	quic_outq_free(sk);
+	quic_inq_free(sk);
 	quic_timer_free(sk);
 	quic_packet_free(sk);
 
