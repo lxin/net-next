@@ -838,10 +838,17 @@ static struct sk_buff *quic_packet_app_create(struct sock *sk, gfp_t gfp)
 void quic_packet_mss_update(struct sock *sk, u32 mss)
 {
 	struct quic_packet *packet = quic_packet(sk);
+	struct quic_outqueue *outq = quic_outq(sk);
 	struct quic_cong *cong = quic_cong(sk);
 
+	/* Limit MSS for regular QUIC packets to the max UDP payload size. */
+	if (outq->max_udp_payload_size && mss > outq->max_udp_payload_size)
+		mss = outq->max_udp_payload_size;
 	packet->mss = (u16)mss;
+
+	/* Update congestion control with new payload space (including tag). */
 	quic_cong_set_mss(cong, packet->mss);
+	quic_outq_sync_window(sk, cong->window);
 }
 
 /* Perform routing for the QUIC packet on the specified path, update header
